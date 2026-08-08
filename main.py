@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from dotenv import load_dotenv
-from routers import crons
+from routers import crons, pagos, totalpass
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
   check_recordatorios_clase,
@@ -13,7 +13,8 @@ app = FastAPI(title="Navy Backend")
 
 # Routers
 app.include_router(crons.router, prefix="/crons")
-
+app.include_router(pagos.router, prefix="/pagos")
+app.include_router(totalpass.router, prefix="/totalpass")
 # Scheduler
 scheduler = AsyncIOScheduler()
 
