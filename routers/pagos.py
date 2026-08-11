@@ -20,6 +20,9 @@ class ConfirmarCheckoutRequest(BaseModel):
   checkout_id: str
   order_id:    str
   monto:       float
+class PagarPenalizacionRequest(BaseModel):
+  cliente_id:       str
+  penalizacion_id:  str
 
 @router.post("/procesar")
 async def procesar_pago(req: PagoRequest):
@@ -196,5 +199,76 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
     "paquete_id":     req.paquete_id,
     "fecha_venc_plan": fecha_fin,
   }).eq("id", req.cliente_id).execute()
+
+  return { "ok": True }
+
+@router.post("/pagar-penalizacion")
+async def pagar_penalizacion(req: PagarPenalizacionRequest):
+  # Traer penalización
+  pen_res = supabase.table("penalizaciones_noshow")\
+    .select("*, clientes(nombre_completo, email)")\
+    .eq("id", req.penalizacion_id)\
+    .eq("estatus", "Pendiente")\
+    .single().execute()
+
+  if not pen_res.data:
+    raise HTTPException(status_code=404, detail="Penalización no encontrada")
+
+  pen    = pen_res.data
+  monto  = pen["monto"]
+  cliente = pen["clientes"]
+
+  # Crear checkout en OrkestaPay
+  token = await get_access_token()
+  merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
+
+  async with httpx.AsyncClient(timeout=30.0) as client:
+    res = await client.post(
+      f"{BASE_URL}/checkouts",
+      headers={ "Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json" },
+      json={
+        "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
+        "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
+        "allow_save_payment_methods": False,
+        "locale": "ES_LATAM",
+        "order": {
+          "merchant_order_id": merchant_order_id,
+          "currency":          "MXN",
+          "subtotal_amount":   monto,
+          "total_amount":      monto,
+          "country_code":      "MX",
+          "products": [{
+            "product_id": req.penalizacion_id,
+            "name":       "Penalización No Show",
+            "quantity":   1,
+            "unit_price": monto,
+          }],
+          "customer": {
+            "first_name": cliente["nombre_completo"].split()[0],
+            "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
+            "email":      cliente["email"],
+          }
+        }
+      }
+    )
+    res.raise_for_status()
+    data = res.json()
+
+  return {
+    "checkout_url": data["checkout_redirect_url"],
+    "checkout_id":  data["checkout_id"],
+    "order_id":     data["order"]["order_id"],
+  }
+
+@router.post("/confirmar-penalizacion")
+async def confirmar_penalizacion(req: dict):
+  penalizacion_id = req.get("penalizacion_id")
+  checkout_id     = req.get("checkout_id")
+  order_id        = req.get("order_id")
+
+  supabase.table("penalizaciones_noshow").update({
+    "estatus":                "Pagado",
+    "orkestapay_payment_id":  order_id,
+  }).eq("id", penalizacion_id).execute()
 
   return { "ok": True }

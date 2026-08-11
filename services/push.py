@@ -120,3 +120,79 @@ async def check_membresias_por_vencer():
           cuerpo=f"Hola {nombre}, tu plan {paquete} vence pronto. ¡Renuévalo para seguir entrenando!",
           data={ "tipo": "membresia_vence", "membresia_id": m["id"] }
         )
+
+async def check_no_shows():
+  """Corre cada hora — detecta clases terminadas con reservas sin check-in"""
+  from datetime import datetime, timezone, timedelta
+  
+  ahora = datetime.now(timezone.utc)
+  hace1h = ahora - timedelta(hours=1)
+
+  # Clases que terminaron en la última hora
+  clases_res = supabase.table("clases")\
+    .select("id, nombre_clase, duracion_minutos, horario, sucursal_id")\
+    .eq("estado", "Activa")\
+    .lte("horario", hace1h.isoformat())\
+    .gte("horario", (hace1h - timedelta(hours=1)).isoformat())\
+    .execute()
+
+  for clase in (clases_res.data or []):
+    # Reservas confirmadas de esa clase
+    reservas_res = supabase.table("reservas")\
+      .select("id, cliente_id, clientes(paquete_id, paquetes(penalizacion_noshow, monto_penalizacion))")\
+      .eq("clase_id", clase["id"])\
+      .eq("estatus", "Confirmada")\
+      .execute()
+
+    for reserva in (reservas_res.data or []):
+      cliente_id = reserva["cliente_id"]
+      paquete    = reserva["clientes"]["paquetes"]
+
+      if not paquete or not paquete.get("penalizacion_noshow"):
+        continue
+
+      # Verificar si hizo check-in
+      checkin_res = supabase.table("asistencias")\
+        .select("id")\
+        .eq("cliente_id", cliente_id)\
+        .eq("clase_id", clase["id"])\
+        .maybe_single().execute()
+
+      if checkin_res.data:
+        continue  # Sí hizo check-in, no hay No Show
+
+      # Verificar si ya tiene penalización para esta reserva
+      ya_penalizado = supabase.table("penalizaciones_noshow")\
+        .select("id")\
+        .eq("reserva_id", reserva["id"])\
+        .maybe_single().execute()
+
+      if ya_penalizado.data:
+        continue  # Ya fue penalizado
+
+      monto = paquete.get("monto_penalizacion", 150)
+
+      # Crear penalización
+      supabase.table("penalizaciones_noshow").insert({
+        "cliente_id": cliente_id,
+        "reserva_id": reserva["id"],
+        "clase_id":   clase["id"],
+        "monto":      monto,
+        "estatus":    "Pendiente",
+      }).execute()
+
+      # Marcar reserva como No Show
+      supabase.table("reservas").update({ "estatus": "No Show" })\
+        .eq("id", reserva["id"]).execute()
+
+      # Push al cliente
+      tokens_res = supabase.table("push_tokens")\
+        .select("token").eq("cliente_id", cliente_id).execute()
+      tokens = [t["token"] for t in (tokens_res.data or [])]
+
+      await enviar_push(
+        tokens,
+        titulo="⚠️ No Show registrado",
+        cuerpo=f"No te presentaste a {clase['nombre_clase']}. Tienes un cargo pendiente de ${monto} MXN.",
+        data={ "tipo": "no_show", "monto": monto }
+      )

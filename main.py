@@ -5,6 +5,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
   check_recordatorios_clase,
   check_membresias_por_vencer,
+  check_no_shows,
 )
 
 load_dotenv()
@@ -24,6 +25,7 @@ async def startup():
   scheduler.add_job(check_recordatorios_clase,   'cron', minute=0)
   # Cada día a las 8am CST — membresías por vencer
   scheduler.add_job(check_membresias_por_vencer, 'cron', hour=14, minute=0)  # 14 UTC = 8am CST
+  scheduler.add_job(check_no_shows, 'cron', minute=30)  # cada hora a los :30
   scheduler.start()
 
 @app.on_event("shutdown")
