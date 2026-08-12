@@ -272,3 +272,4 @@ async def confirmar_penalizacion(req: dict):
   }).eq("id", penalizacion_id).execute()
 
   return { "ok": True }
+

@@ -88,6 +88,27 @@ async def check_recordatorios_clase():
         data={ "tipo": "recordatorio_clase", "reserva_id": r["id"] }
       )
 
+async def check_clases_en_curso():
+  ahora = datetime.now(timezone.utc)
+  
+  # Traer clases activas
+  clases_res = supabase.table("clases")\
+    .select("id, horario, duracion_minutos")\
+    .eq("estado", "Activa")\
+    .execute()
+
+  for clase in (clases_res.data or []):
+    horario  = datetime.fromisoformat(clase["horario"])
+    duracion = clase.get("duracion_minutos", 60)
+    fin      = horario + timedelta(minutes=duracion)
+
+    if horario <= ahora <= fin:
+      supabase.table("clases").update({ "estado_actual": "En curso" })\
+        .eq("id", clase["id"]).execute()
+    elif ahora > fin:
+      supabase.table("clases").update({ "estado_actual": "Finalizada" })\
+        .eq("id", clase["id"]).execute()
+      
 async def check_membresias_por_vencer():
   """Corre diario a las 8am CST — manda push y correo a clientes con membresía por vencer"""
   hoy = datetime.now(timezone.utc).date()
@@ -127,22 +148,32 @@ async def check_no_shows():
   
   ahora = datetime.now(timezone.utc)
   hace1h = ahora - timedelta(hours=1)
+  hace2h = ahora - timedelta(hours=4)
+
+  print(f"Buscando clases entre {hace2h} y {hace1h}")
 
   # Clases que terminaron en la última hora
   clases_res = supabase.table("clases")\
     .select("id, nombre_clase, duracion_minutos, horario, sucursal_id")\
     .eq("estado", "Activa")\
     .lte("horario", hace1h.isoformat())\
-    .gte("horario", (hace1h - timedelta(hours=1)).isoformat())\
+    .gte("horario", hace2h.isoformat())\
     .execute()
 
+  print(f"Clases encontradas: {len(clases_res.data or [])}")
+  print(clases_res.data)
+
   for clase in (clases_res.data or []):
+    print(f"Procesando clase: {clase['nombre_clase']}")
     # Reservas confirmadas de esa clase
     reservas_res = supabase.table("reservas")\
       .select("id, cliente_id, clientes(paquete_id, paquetes(penalizacion_noshow, monto_penalizacion))")\
       .eq("clase_id", clase["id"])\
       .eq("estatus", "Confirmada")\
       .execute()
+
+    print(f"Reservas encontradas: {len(reservas_res.data or [])}")
+    print(reservas_res.data)
 
     for reserva in (reservas_res.data or []):
       cliente_id = reserva["cliente_id"]
@@ -158,7 +189,7 @@ async def check_no_shows():
         .eq("clase_id", clase["id"])\
         .maybe_single().execute()
 
-      if checkin_res.data:
+      if checkin_res and checkin_res.data:
         continue  # Sí hizo check-in, no hay No Show
 
       # Verificar si ya tiene penalización para esta reserva
@@ -167,8 +198,8 @@ async def check_no_shows():
         .eq("reserva_id", reserva["id"])\
         .maybe_single().execute()
 
-      if ya_penalizado.data:
-        continue  # Ya fue penalizado
+      if ya_penalizado and ya_penalizado.data:
+        continue # Ya fue penalizado
 
       monto = paquete.get("monto_penalizacion", 150)
 
@@ -190,9 +221,16 @@ async def check_no_shows():
         .select("token").eq("cliente_id", cliente_id).execute()
       tokens = [t["token"] for t in (tokens_res.data or [])]
 
+
+      
       await enviar_push(
         tokens,
         titulo="⚠️ No Show registrado",
         cuerpo=f"No te presentaste a {clase['nombre_clase']}. Tienes un cargo pendiente de ${monto} MXN.",
         data={ "tipo": "no_show", "monto": monto }
       )
+
+    # Al final del loop — marcar clase como Finalizada
+    supabase.table("clases").update({ "estado_actual": "Finalizada" })\
+      .eq("id", clase["id"]).execute()
+    print(f"Clase {clase['nombre_clase']} marcada como Finalizada")

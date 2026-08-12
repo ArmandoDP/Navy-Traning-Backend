@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Header, HTTPException
-from services.push import check_recordatorios_clase, check_membresias_por_vencer
+from services.push import check_recordatorios_clase, check_membresias_por_vencer, check_no_shows
 import os
 
 router = APIRouter()
@@ -19,3 +19,17 @@ async def run_membresias(x_cron_secret: str = Header(None)):
     raise HTTPException(status_code=401, detail="Unauthorized")
   await check_membresias_por_vencer()
   return { "ok": True, "job": "membresias_vencer" }
+
+@router.post("/no-shows")
+async def run_no_shows(x_cron_secret: str = Header(None)):
+  if x_cron_secret != CRON_SECRET:
+    raise HTTPException(status_code=401, detail="Unauthorized")
+  await check_no_shows()
+  return { "ok": True, "job": "no_shows" }
+
+@router.post("/clases-en-curso")
+async def run_clases_en_curso(x_cron_secret: str = Header(None)):
+  if x_cron_secret != CRON_SECRET:
+    raise HTTPException(status_code=401, detail="Unauthorized")
+  await check_clases_en_curso()
+  return { "ok": True, "job": "clases_en_curso" }
