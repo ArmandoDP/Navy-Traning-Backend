@@ -24,6 +24,15 @@ class PagarPenalizacionRequest(BaseModel):
   cliente_id:       str
   penalizacion_id:  str
 
+class CrearCheckoutRequest(BaseModel):
+  cliente_id:        str
+  paquete_id:        str
+  sucursal_id:       str  # ← agrega
+  payment_method_id: str = ''
+  device_session_id: str = ''
+  monto:             float
+
+  
 @router.post("/procesar")
 async def procesar_pago(req: PagoRequest):
   # 1. Traer datos del cliente y paquete
@@ -98,26 +107,30 @@ async def procesar_pago(req: PagoRequest):
 
 
 @router.post("/crear-checkout")
-async def crear_checkout(req: PagoRequest):
-  # 1. Traer datos
+async def crear_checkout(req: CrearCheckoutRequest):
+  from services.orkestapay import get_access_token_sucursal
+
+  paquete_res = supabase.table("paquetes").select("nombre").eq("id", req.paquete_id).single().execute()
+  paquete     = paquete_res.data
+
   cliente_res = supabase.table("clientes").select("nombre_completo, email").eq("id", req.cliente_id).single().execute()
-  paquete_res = supabase.table("paquetes").select("id, nombre, vigencia_dias").eq("id", req.paquete_id).single().execute()
+  cliente     = cliente_res.data
 
-  if not cliente_res.data or not paquete_res.data:
-    raise HTTPException(status_code=404, detail="Cliente o paquete no encontrado")
+  token, keys = await get_access_token_sucursal(req.sucursal_id)
+  
+  ambiente = keys["ambiente"]
+  base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
 
-  cliente = cliente_res.data
-  paquete = paquete_res.data
   merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
 
-  # 2. Obtener token
-  token = await get_access_token()
-
-  # 3. Crear checkout
-  async with httpx.AsyncClient() as client:
+  async with httpx.AsyncClient(timeout=30.0) as client:
     res = await client.post(
-      f"{BASE_URL}/checkouts",
-      headers={ "Authorization": f"Bearer {token}", "Accept": "application/json" },
+      f"{base_url}/checkouts",
+      headers={
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/json",
+        "Content-Type":  "application/json",
+      },
       json={
         "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
         "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
@@ -130,7 +143,7 @@ async def crear_checkout(req: PagoRequest):
           "total_amount":      req.monto,
           "country_code":      "MX",
           "products": [{
-            "product_id": paquete["id"],
+            "product_id": req.paquete_id,
             "name":       paquete["nombre"],
             "quantity":   1,
             "unit_price": req.monto,
@@ -204,9 +217,10 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
 
 @router.post("/pagar-penalizacion")
 async def pagar_penalizacion(req: PagarPenalizacionRequest):
-  # Traer penalización
+  from services.orkestapay import get_access_token_sucursal
+
   pen_res = supabase.table("penalizaciones_noshow")\
-    .select("*, clientes(nombre_completo, email)")\
+    .select("*, clientes(nombre_completo, email, sucursal_id)")\
     .eq("id", req.penalizacion_id)\
     .eq("estatus", "Pendiente")\
     .single().execute()
@@ -214,17 +228,21 @@ async def pagar_penalizacion(req: PagarPenalizacionRequest):
   if not pen_res.data:
     raise HTTPException(status_code=404, detail="Penalización no encontrada")
 
-  pen    = pen_res.data
-  monto  = pen["monto"]
+  pen     = pen_res.data
+  monto   = pen["monto"]
   cliente = pen["clientes"]
 
-  # Crear checkout en OrkestaPay
-  token = await get_access_token()
+  # ← Usar keys de la sucursal del cliente
+  sucursal_id = cliente["sucursal_id"]
+  token, keys = await get_access_token_sucursal(sucursal_id)
+  ambiente    = keys["ambiente"]
+  base_url    = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
+
   merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
 
   async with httpx.AsyncClient(timeout=30.0) as client:
     res = await client.post(
-      f"{BASE_URL}/checkouts",
+      f"{base_url}/checkouts",
       headers={ "Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json" },
       json={
         "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",

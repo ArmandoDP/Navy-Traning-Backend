@@ -1,6 +1,7 @@
 import os
 import httpx
 from dotenv import load_dotenv
+from services.supabase import supabase
 
 load_dotenv()
 
@@ -77,3 +78,34 @@ async def registrar_pago(token, order_id, payment_method_id, device_session_id, 
     print("Pago response:", res.status_code, res.text)
     res.raise_for_status()
     return res.json()
+
+
+def get_orkestapay_keys(sucursal_id: str) -> dict:
+  res = supabase.table("sucursal_orkestapay")\
+    .select("client_id, client_secret, merchant_id, public_key, ambiente")\
+    .eq("sucursal_id", sucursal_id)\
+    .single().execute()
+  
+  if not res.data:
+    raise Exception(f"No hay keys de OrkestaPay para sucursal {sucursal_id}")
+  
+  return res.data
+
+async def get_access_token_sucursal(sucursal_id: str) -> tuple:
+  keys = get_orkestapay_keys(sucursal_id)
+  
+  ambiente = keys["ambiente"]
+  base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
+  
+  async with httpx.AsyncClient(timeout=30.0) as client:
+    res = await client.post(
+      f"{base_url}/oauth/tokens",
+      json={
+        "client_id":     keys["client_id"],
+        "client_secret": keys["client_secret"],
+        "grant_type":    "client_credentials",
+      }
+    )
+    print("Auth sucursal response:", res.status_code, res.text)
+    res.raise_for_status()
+    return res.json()["access_token"], keys
