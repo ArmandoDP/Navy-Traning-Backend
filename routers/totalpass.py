@@ -35,7 +35,7 @@ async def validar_checkin(endpoint: str, token: str):
 @router.post("/webhook")
 async def totalpass_webhook(request: Request):
   body = await request.json()
-  print("TotalPass webhook recibido:", body)
+  print("=== TotalPass webhook recibido ===")
 
   try:
     user     = body.get("user", {})
@@ -47,17 +47,17 @@ async def totalpass_webhook(request: Request):
 
     email = user.get("email")
     cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
-    cliente_id  = cliente_res.data["id"] if cliente_res.data else None
+    cliente_id = cliente_res.data["id"] if cliente_res and cliente_res.data else None
 
     # Detectar sucursal por gym_id
     gym_id = body.get("checkin", {}).get("gym_id") or body.get("gym", {}).get("id")
     sucursal_res = supabase.table("sucursales")\
       .select("id, totalpass_place_api_key")\
-      .eq("totalpass_place_api_key", str(gym_id) if gym_id else "")\
+      .eq("totalpass_place_identifier", str(gym_id) if gym_id else "")\
       .maybe_single().execute()
     
     # Si no encontramos por gym_id, usar Condesa como default para pruebas
-    place_api_key = sucursal_res.data["totalpass_place_api_key"] if sucursal_res.data else os.getenv("TOTALPASS_PLACE_API_KEY")
+    place_api_key = sucursal_res.data["totalpass_place_api_key"] if sucursal_res and sucursal_res.data else os.getenv("TOTALPASS_PLACE_API_KEY")
 
     supabase.table("totalpass_checkins").insert({
       "email":      email,
