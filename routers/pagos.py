@@ -132,29 +132,29 @@ async def crear_checkout(req: CrearCheckoutRequest):
         "Content-Type":  "application/json",
       },
       json={
-        "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
-        "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
-        "allow_save_payment_methods": False,
-        "locale": "ES_LATAM",
-        "order": {
-          "merchant_order_id": merchant_order_id,
-          "currency":          "MXN",
-          "subtotal_amount":   req.monto,
-          "total_amount":      req.monto,
-          "country_code":      "MX",
-          "products": [{
-            "product_id": req.paquete_id,
-            "name":       paquete["nombre"],
-            "quantity":   1,
-            "unit_price": req.monto,
-          }],
-          "customer": {
-            "first_name": cliente["nombre_completo"].split()[0],
-            "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
-            "email":      cliente["email"],
-          }
+      "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
+      "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
+      "allow_save_payment_methods": False,  # ← boolean, no string
+      "locale": "ES_LATAM",
+      "order": {
+        "merchant_order_id": merchant_order_id,
+        "currency":          "MXN",
+        "subtotal_amount":   req.monto,
+        "total_amount":      req.monto,
+        "country_code":      "MX",
+        "products": [{
+          "product_id": req.paquete_id,
+          "name":       paquete["nombre"],
+          "quantity":   1,  # ← número, no string
+          "unit_price": req.monto,
+        }],
+        "customer": {
+          "first_name": cliente["nombre_completo"].split()[0],
+          "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
+          "email":      cliente["email"],
         }
       }
+    }
     )
     print("Checkout response:", res.status_code, res.text)
     res.raise_for_status()
