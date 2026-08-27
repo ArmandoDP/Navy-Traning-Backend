@@ -31,6 +31,7 @@ class CrearCheckoutRequest(BaseModel):
   payment_method_id: str = ''
   device_session_id: str = ''
   monto:             float
+  allow_save_payment_methods: bool = True 
 
   
 @router.post("/procesar")
@@ -134,7 +135,7 @@ async def crear_checkout(req: CrearCheckoutRequest):
       json={
       "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
       "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
-      "allow_save_payment_methods": True,  # ← boolean, no string
+      "allow_save_payment_methods": req.allow_save_payment_methods,  # ← boolean, no string
       "locale": "ES_LATAM",
       "order": {
         "merchant_order_id": merchant_order_id,
@@ -247,7 +248,7 @@ async def pagar_penalizacion(req: PagarPenalizacionRequest):
       json={
         "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
         "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
-        "allow_save_payment_methods": False,
+        "allow_save_payment_methods": req.allow_save_payment_methods,
         "locale": "ES_LATAM",
         "order": {
           "merchant_order_id": merchant_order_id,
