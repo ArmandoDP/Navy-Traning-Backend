@@ -136,7 +136,6 @@ async def crear_customer(sucursal_id: str, cliente: dict) -> str:
     return res.json()["customer_id"]
 
 async def listar_metodos_pago(sucursal_id: str, customer_id: str) -> list:
-  """Lista los métodos de pago guardados de un customer"""
   token, keys = await get_access_token_sucursal(sucursal_id)
   ambiente = keys["ambiente"]
   base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
@@ -146,7 +145,8 @@ async def listar_metodos_pago(sucursal_id: str, customer_id: str) -> list:
       f"{base_url}/customers/{customer_id}/payment-methods",
       headers={ "Authorization": f"Bearer {token}" }
     )
-    print("Listar métodos pago response:", res.status_code, res.text)
+    if res.status_code == 404:
+      return []
     res.raise_for_status()
     return res.json()
 

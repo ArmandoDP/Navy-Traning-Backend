@@ -109,13 +109,22 @@ async def procesar_pago(req: PagoRequest):
 
 @router.post("/crear-checkout")
 async def crear_checkout(req: CrearCheckoutRequest):
-  from services.orkestapay import get_access_token_sucursal
+  from services.orkestapay import get_access_token_sucursal, crear_customer
 
   paquete_res = supabase.table("paquetes").select("nombre").eq("id", req.paquete_id).single().execute()
   paquete     = paquete_res.data
 
-  cliente_res = supabase.table("clientes").select("nombre_completo, email").eq("id", req.cliente_id).single().execute()
+  cliente_res = supabase.table("clientes").select("nombre_completo, email, orkestapay_customer_id")\
+    .eq("id", req.cliente_id).single().execute()
   cliente     = cliente_res.data
+
+  # Obtener o crear customer en OrkestaPay
+  customer_id = cliente.get("orkestapay_customer_id")
+  if not customer_id:
+    customer_id = await crear_customer(req.sucursal_id, cliente)
+    supabase.table("clientes").update({
+      "orkestapay_customer_id": customer_id
+    }).eq("id", req.cliente_id).execute()
 
   token, keys = await get_access_token_sucursal(req.sucursal_id)
   
@@ -133,29 +142,30 @@ async def crear_checkout(req: CrearCheckoutRequest):
         "Content-Type":  "application/json",
       },
       json={
-      "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
-      "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
-      "allow_save_payment_methods": req.allow_save_payment_methods,  # ← boolean, no string
-      "locale": "ES_LATAM",
-      "order": {
-        "merchant_order_id": merchant_order_id,
-        "currency":          "MXN",
-        "subtotal_amount":   req.monto,
-        "total_amount":      req.monto,
-        "country_code":      "MX",
-        "products": [{
-          "product_id": req.paquete_id,
-          "name":       paquete["nombre"],
-          "quantity":   1,  # ← número, no string
-          "unit_price": req.monto,
-        }],
-        "customer": {
-          "first_name": cliente["nombre_completo"].split()[0],
-          "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
-          "email":      cliente["email"],
+        "completed_redirect_url":     "https://crm.navytrainingcenter.com/pago/completado",
+        "canceled_redirect_url":      "https://crm.navytrainingcenter.com/pago/cancelado",
+        "allow_save_payment_methods": req.allow_save_payment_methods,
+        "customer_id":                customer_id,  # ← agrega esto
+        "locale": "ES_LATAM",
+        "order": {
+          "merchant_order_id": merchant_order_id,
+          "currency":          "MXN",
+          "subtotal_amount":   req.monto,
+          "total_amount":      req.monto,
+          "country_code":      "MX",
+          "products": [{
+            "product_id": req.paquete_id,
+            "name":       paquete["nombre"],
+            "quantity":   1,
+            "unit_price": req.monto,
+          }],
+          "customer": {
+            "first_name": cliente["nombre_completo"].split()[0],
+            "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
+            "email":      cliente["email"],
+          }
         }
       }
-    }
     )
     print("Checkout response:", res.status_code, res.text)
     res.raise_for_status()
