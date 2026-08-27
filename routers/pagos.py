@@ -134,7 +134,7 @@ async def crear_checkout(req: CrearCheckoutRequest):
       json={
       "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
       "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
-      "allow_save_payment_methods": False,  # ← boolean, no string
+      "allow_save_payment_methods": True,  # ← boolean, no string
       "locale": "ES_LATAM",
       "order": {
         "merchant_order_id": merchant_order_id,
