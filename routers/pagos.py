@@ -182,6 +182,22 @@ async def crear_checkout(req: CrearCheckoutRequest):
 async def confirmar_checkout(req: ConfirmarCheckoutRequest):
   from datetime import date, timedelta
 
+  # Buscar si tiene membresía activa
+  memb_activa = supabase.table("membresias").select("fecha_fin")\
+    .eq("cliente_id", req.cliente_id).eq("estatus", "Activa")\
+    .order("fecha_fin", desc=True).limit(1).execute()
+
+  # Si tiene membresía activa, la nueva empieza cuando termina la anterior
+  if memb_activa.data:
+    from datetime import date
+    fecha_fin_actual = date.fromisoformat(memb_activa.data[0]["fecha_fin"])
+    hoy = date.today()
+    fecha_inicio = max(hoy, fecha_fin_actual).isoformat()  # la más lejana entre hoy y fin actual
+  else:
+    fecha_inicio = date.today().isoformat()
+
+  fecha_fin = (date.fromisoformat(fecha_inicio) + timedelta(days=paquete.get("vigencia_dias", 30))).isoformat()
+
   paquete_res = supabase.table("paquetes").select("nombre, vigencia_dias")\
     .eq("id", req.paquete_id).single().execute()
   paquete = paquete_res.data
@@ -203,8 +219,8 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
   }).execute()
 
   # Desactivar membresía anterior
-  supabase.table("membresias").update({ "estatus": "Inactiva" })\
-    .eq("cliente_id", req.cliente_id).eq("estatus", "Activa").execute()
+  # supabase.table("membresias").update({ "estatus": "Inactiva" })\
+  #   .eq("cliente_id", req.cliente_id).eq("estatus", "Activa").execute()
 
   # Crear nueva membresía
   supabase.table("membresias").insert({
