@@ -291,3 +291,73 @@ async def confirmar_penalizacion(req: dict):
 
   return { "ok": True }
 
+@router.post("/crear-customer")
+async def crear_customer_endpoint(req: dict):
+  cliente_id  = req.get("cliente_id")
+  sucursal_id = req.get("sucursal_id")
+
+  cli = supabase.table("clientes").select("nombre_completo, email, orkestapay_customer_id")\
+    .eq("id", cliente_id).single().execute()
+
+  if not cli.data:
+    raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+  # Si ya tiene customer_id, regresar ese
+  if cli.data.get("orkestapay_customer_id"):
+    return { "customer_id": cli.data["orkestapay_customer_id"] }
+
+  # Crear en OrkestaPay
+  from services.orkestapay import crear_customer
+  customer_id = await crear_customer(sucursal_id, cli.data)
+
+  # Guardar en DB
+  supabase.table("clientes").update({
+    "orkestapay_customer_id": customer_id
+  }).eq("id", cliente_id).execute()
+
+  return { "customer_id": customer_id }
+
+
+@router.get("/metodos-pago/{cliente_id}")
+async def listar_metodos_pago_endpoint(cliente_id: str):
+  from services.orkestapay import listar_metodos_pago
+
+  cli = supabase.table("clientes")\
+    .select("orkestapay_customer_id, sucursal_id")\
+    .eq("id", cliente_id).single().execute()
+
+  if not cli.data or not cli.data.get("orkestapay_customer_id"):
+    return { "metodos": [] }
+
+  metodos = await listar_metodos_pago(cli.data["sucursal_id"], cli.data["orkestapay_customer_id"])
+  return { "metodos": metodos }
+
+
+@router.post("/cobrar-tarjeta")
+async def cobrar_tarjeta_endpoint(req: dict):
+  from services.orkestapay import cobrar_tarjeta_guardada
+  import uuid
+
+  cliente_id        = req.get("cliente_id")
+  payment_method_id = req.get("payment_method_id")
+  monto             = req.get("monto")
+  concepto          = req.get("concepto", "Compra De Gali")
+
+  cli = supabase.table("clientes")\
+    .select("orkestapay_customer_id, sucursal_id, nombre_completo")\
+    .eq("id", cliente_id).single().execute()
+
+  if not cli.data or not cli.data.get("orkestapay_customer_id"):
+    raise HTTPException(status_code=400, detail="Cliente no tiene customer de OrkestaPay")
+
+  idempotency_key = str(uuid.uuid4()).replace("-", "")
+  resultado = await cobrar_tarjeta_guardada(
+    sucursal_id       = cli.data["sucursal_id"],
+    customer_id       = cli.data["orkestapay_customer_id"],
+    payment_method_id = payment_method_id,
+    monto             = monto,
+    concepto          = concepto,
+    idempotency_key   = idempotency_key,
+  )
+
+  return { "ok": True, "payment_id": resultado.get("payment_id") }

@@ -109,3 +109,97 @@ async def get_access_token_sucursal(sucursal_id: str) -> tuple:
     print("Auth sucursal response:", res.status_code, res.text)
     res.raise_for_status()
     return res.json()["access_token"], keys
+  
+
+async def crear_customer(sucursal_id: str, cliente: dict) -> str:
+  """Crea un customer en OrkestaPay y regresa el customer_id"""
+  token, keys = await get_access_token_sucursal(sucursal_id)
+  ambiente = keys["ambiente"]
+  base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
+
+  nombre_parts = cliente.get("nombre_completo", "").split()
+  first_name   = nombre_parts[0] if nombre_parts else "N/A"
+  last_name    = " ".join(nombre_parts[1:]) if len(nombre_parts) > 1 else "N/A"
+
+  async with httpx.AsyncClient(timeout=30.0) as client:
+    res = await client.post(
+      f"{base_url}/customers",
+      headers={ "Authorization": f"Bearer {token}", "Content-Type": "application/json" },
+      json={
+        "first_name": first_name,
+        "last_name":  last_name,
+        "email":      cliente.get("email"),
+      }
+    )
+    print("Crear customer response:", res.status_code, res.text)
+    res.raise_for_status()
+    return res.json()["customer_id"]
+
+async def listar_metodos_pago(sucursal_id: str, customer_id: str) -> list:
+  """Lista los métodos de pago guardados de un customer"""
+  token, keys = await get_access_token_sucursal(sucursal_id)
+  ambiente = keys["ambiente"]
+  base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
+
+  async with httpx.AsyncClient(timeout=30.0) as client:
+    res = await client.get(
+      f"{base_url}/customers/{customer_id}/payment-methods",
+      headers={ "Authorization": f"Bearer {token}" }
+    )
+    print("Listar métodos pago response:", res.status_code, res.text)
+    res.raise_for_status()
+    return res.json()
+
+async def cobrar_tarjeta_guardada(sucursal_id: str, customer_id: str, payment_method_id: str, monto: float, concepto: str, idempotency_key: str) -> dict:
+  """Cobra directamente a una tarjeta guardada sin checkout"""
+  token, keys = await get_access_token_sucursal(sucursal_id)
+  ambiente = keys["ambiente"]
+  base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
+
+  import uuid
+  merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
+
+  async with httpx.AsyncClient(timeout=30.0) as client:
+    # 1. Crear orden
+    orden_res = await client.post(
+      f"{base_url}/orders",
+      headers={ "Authorization": f"Bearer {token}", "Content-Type": "application/json" },
+      json={
+        "merchant_order_id": merchant_order_id,
+        "currency":          "MXN",
+        "subtotal_amount":   monto,
+        "total_amount":      monto,
+        "country_code":      "MX",
+        "customer_id":       customer_id,
+        "products": [{
+          "product_id": "degali-001",
+          "name":       concepto,
+          "quantity":   1,
+          "unit_price": monto,
+        }],
+      }
+    )
+    orden_res.raise_for_status()
+    order_id = orden_res.json()["order_id"]
+
+    # 2. Cobrar
+    pago_res = await client.post(
+      f"{base_url}/payments",
+      headers={
+        "Authorization":   f"Bearer {token}",
+        "Content-Type":    "application/json",
+        "Idempotency-Key": idempotency_key,
+      },
+      json={
+        "order_id": order_id,
+        "payment_source": {
+          "type":              "CARD",
+          "payment_method_id": payment_method_id,
+          "customer_id":       customer_id,
+          "settings": { "card": { "capture": True } }
+        },
+      }
+    )
+    print("Cobrar tarjeta response:", pago_res.status_code, pago_res.text)
+    pago_res.raise_for_status()
+    return pago_res.json()
