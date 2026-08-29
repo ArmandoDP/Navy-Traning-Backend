@@ -1,0 +1,69 @@
+/* 1. IMPORTS PRIMERO */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+@import "tailwindcss";
+
+/* ─── Variables globales ──────────────────────────────────────────────────── */
+:root {
+  --sidebar-bg:          #171B24;
+  --sidebar-active:      #44516B;
+  --sidebar-hover:       #232B38;
+  --sidebar-border:      #2A3344;
+  --sidebar-text:        #A0AABF;
+  --sidebar-text-active: #FFFFFF;
+
+  --primary:       #6366F1;
+  --primary-hover: #4F46E5;
+  --primary-light: #EEF2FF;
+
+  --bg-main:  #F4F5F7;
+  --bg-card:  #FFFFFF;
+  --border:   #E5E7EB;
+
+  --text-primary:   #111827;
+  --text-secondary: #6B7280;
+  --text-muted:     #9CA3AF;
+
+  --green:  #22C55E;
+  --red:    #EF4444;
+  --yellow: #F59E0B;
+  --blue:   #3B82F6;
+  --orange: #F97316;
+}
+
+/* ─── Base ────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: #F4F5F7;
+  color: #111827;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ─── Botón primario global ───────────────────────────────────────────────── */
+.btn-dark {
+  background-color: #171B24;
+  color: white;
+  transition: background-color 0.15s;
+}
+.btn-dark:hover {
+  background-color: #232B38;
+}
+.btn-dark:disabled {
+  opacity: 0.4;
+}
+::-webkit-scrollbar       { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: #4B5563; }
+
+#qr-reader video {
+  width: 100% !important;
+  height: auto !important;
+  border-radius: 12px;
+}
+
+#qr-reader canvas {
+  display: none;
+}
