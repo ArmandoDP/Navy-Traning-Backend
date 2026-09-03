@@ -127,7 +127,7 @@ async def check_membresias_por_vencer():
     fecha_vence = hoy + timedelta(days=dias)
 
     membresias = supabase.table("membresias")\
-      .select("*, clientes(nombre_completo, email, push_tokens(token)), paquetes(nombre)")\
+      .select("*, renovacion_cancelada, clientes(nombre_completo, email, push_tokens(token)), paquetes(nombre)")\
       .eq("estatus", "Activa")\
       .eq("fecha_fin", fecha_vence.isoformat())\
       .execute()
@@ -369,7 +369,7 @@ async def check_renovaciones_recurrentes():
     fecha_vence = hoy + timedelta(days=dias)
 
     membresias = supabase.table("membresias")\
-      .select("*, clientes(id, nombre_completo, email, sucursal_id, orkestapay_customer_id, push_tokens(token)), paquetes(id, nombre, precio, vigencia_dias, es_recurrente, penalizacion_noshow)")\
+      .select("*, renovacion_cancelada, clientes(id, nombre_completo, email, sucursal_id, orkestapay_customer_id, push_tokens(token)), paquetes(id, nombre, precio, vigencia_dias, es_recurrente, penalizacion_noshow)")\
       .eq("estatus", "Activa")\
       .eq("fecha_fin", fecha_vence.isoformat())\
       .execute()
@@ -381,6 +381,11 @@ async def check_renovaciones_recurrentes():
       email    = cliente.get("email")
       tokens   = [pt["token"] for pt in (cliente.get("push_tokens") or [])]
       es_recurrente = paquete.get("es_recurrente", False)
+
+      # ← agrega esto
+      if m.get("renovacion_cancelada"):
+        print(f"Renovación cancelada para {email}, skipping")
+        continue
 
       if es_recurrente:
         # Intentar cobro automático
