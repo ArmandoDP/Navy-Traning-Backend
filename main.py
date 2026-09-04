@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import crons, pagos, totalpass, totalpass_booking, clientes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,6 +13,16 @@ from services.push import (
 load_dotenv()
 
 app = FastAPI(title="Navy Backend")
+
+# Habilitar CORS para permitir peticiones desde cualquier dispositivo/dominio
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite conexiones desde cualquier origen/dispositivo
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # Routers
 app.include_router(crons.router, prefix="/crons")

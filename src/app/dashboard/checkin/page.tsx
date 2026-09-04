@@ -1,6 +1,6 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { supabase }            from '@/lib/supabase'
+import { supabase }           from '@/lib/supabase'
 import { useSucursal }         from '@/context/SucursalContext'
 import CheckinLayout           from '@/components/checkin/CheckinLayout'
 
@@ -14,16 +14,35 @@ export default function CheckinPage() {
       .from('asistencias')
       .select(`
         *,
-        clientes(nombre_completo, es_invitado),
-        clases(nombre_clase, horario, duracion_minutos, tipo_clase),
-        sucursales(nombre, color)
+        clientes (
+          id,
+          nombre_completo,
+          es_invitado,
+          origen,
+          es_primera_vez,
+          clases_acumuladas,
+          tiene_paquete_activo,
+          integracion
+        ),
+        clases (
+          id,
+          nombre_clase,
+          horario,
+          duracion_minutos,
+          tipo_clase,
+          total_asistentes
+        ),
+        sucursales (
+          nombre,
+          color
+        )
       `)
       .order('fecha_checkin', { ascending: false })
       .limit(50)
 
     if (sucursalId) q = q.eq('sucursal_id', sucursalId)
 
-    const { data } = await q
+    const { data, error } = await q
     if (data) setCheckins(data)
     setLoading(false)
   }
