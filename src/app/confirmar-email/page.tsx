@@ -70,7 +70,7 @@ export default function ConfirmarEmailPage() {
       backgroundColor: '#171B24',
       display: 'flex',
       alignItems: 'center',
-      justify: 'center',
+      justifyContent: 'center',
       fontFamily: 'sans-serif',
       padding: '20px',
     }}>
