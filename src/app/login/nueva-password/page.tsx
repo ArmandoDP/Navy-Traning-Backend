@@ -23,54 +23,67 @@ export default function NuevaPasswordPage() {
   const router  = useRouter()
   const [pass,    setPass]    = useState('')
   const [confirm, setConfirm] = useState('')
-  const [estado,  setEstado]  = useState<Estado>('idle')
+  const [estado,   setEstado]  = useState<Estado>('idle')
   const [error,   setError]   = useState('')
   const [sesionOk, setSesionOk] = useState(false)
 
   // Extraer token de la URL y autenticar la sesión
   useEffect(() => {
-    const inicializarSesion = async () => {
-      // 1. Extraer tokens del hash (#access_token=...&refresh_token=...)
-      const hash = window.location.hash
-      if (hash && hash.includes('access_token')) {
-        const params = new URLSearchParams(hash.replace('#', ''))
-        const accessToken  = params.get('access_token')
-        const refreshToken = params.get('refresh_token')
-
-        if (accessToken) {
-          const { error: sessionErr } = await supabase.auth.setSession({
-            access_token: accessToken,
-            refresh_token: refreshToken || '',
-          })
-
-          if (!sessionErr) {
-            setSesionOk(true)
-            setEstado('idle')
-            return
-          }
-        }
-      }
-
-      // 2. Si no hay hash, verificar si ya existía sesión activa
-      const { data } = await supabase.auth.getSession()
-      if (data.session) {
-        setSesionOk(true)
-      } else {
-        setEstado('link-invalido')
-      }
-    }
-
-    inicializarSesion()
+    let mounted = true
 
     // Escuchar eventos de cambio de autenticación
     const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'PASSWORD_RECOVERY' || session) {
+      if ((event === 'PASSWORD_RECOVERY' || event === 'SIGNED_IN' || session) && mounted) {
         setSesionOk(true)
         setEstado('idle')
       }
     })
 
+    const inicializarSesion = async () => {
+      const hash = window.location.hash
+      const search = window.location.search
+      const params = new URLSearchParams(hash.replace('#', '') || search)
+
+      const accessToken  = params.get('access_token')
+      const refreshToken = params.get('refresh_token')
+
+      // 1. Si vienen tokens en la URL, establecer la sesión
+      if (accessToken) {
+        const { data, error: sessionErr } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken || '',
+        })
+
+        if (!sessionErr && data.session && mounted) {
+          setSesionOk(true)
+          setEstado('idle')
+          return
+        }
+      }
+
+      // 2. Si no hay tokens en el hash, verificar sesión existente
+      const { data: sessionData } = await supabase.auth.getSession()
+      if (sessionData.session && mounted) {
+        setSesionOk(true)
+        setEstado('idle')
+      } else if (mounted) {
+        // Breve margen por si el almacenamiento local aún está hidratando
+        setTimeout(async () => {
+          const { data: retryData } = await supabase.auth.getSession()
+          if (retryData.session && mounted) {
+            setSesionOk(true)
+            setEstado('idle')
+          } else if (mounted) {
+            setEstado('link-invalido')
+          }
+        }, 500)
+      }
+    }
+
+    inicializarSesion()
+
     return () => {
+      mounted = false
       authListener.subscription.unsubscribe()
     }
   }, [])
