@@ -29,11 +29,35 @@ export default function NuevaPasswordPage() {
 
   // Verificar que haya sesión activa (viene del link de email)
   useEffect(() => {
+  // 1. Verificar si hay sesión actual
+  supabase.auth.getSession().then(({ data }) => {
+    if (data.session) {
+      setSesionOk(true)
+    }
+  })
+
+  // 2. Escuchar cuando Supabase procese el token del hash de la URL
+  const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+    if (event === 'PASSWORD_RECOVERY' || session) {
+      setSesionOk(true)
+      setEstado('idle')
+    }
+  })
+
+  // Timeout de cortesía: Si tras 2.5 segundos no detectó sesión, marcar enlace inválido
+  const timer = setTimeout(() => {
     supabase.auth.getSession().then(({ data }) => {
-      if (data.session) setSesionOk(true)
-      else setEstado('link-invalido')
+      if (!data.session) {
+        setEstado('link-invalido')
+      }
     })
-  }, [])
+  }, 2500)
+
+  return () => {
+    authListener.subscription.unsubscribe()
+    clearTimeout(timer)
+  }
+}, [])
 
   // Validaciones
   const tieneMinimo  = pass.length >= 8

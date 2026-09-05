@@ -98,8 +98,7 @@ export async function POST(req: NextRequest) {
   <div style="max-width:580px;margin:40px auto;padding:0 16px">
 
     <div style="background:linear-gradient(135deg,#171B24 0%,#1e2433 100%);border-radius:20px 20px 0 0;padding:40px 32px;text-align:center">
-      <img src="${logoUrl}" alt="Navy" style="height:48px; whidth:auto; display:inline-block; margin-bottom:20px" />
-      <br>
+      <img src="${logoUrl}" alt="Navy" width="180" style="display:block; whidth:180px; max-width: 100%; height: auto; margin: 0 auto 20px; border: 0;" />
       <div style="display:inline-block;background:rgba(255,255,255,0.08);border-radius:100px;padding:6px 16px;margin-bottom:12px">
         <span style="color:#9ca3af;font-size:11px;font-weight:700;letter-spacing:3px;text-transform:uppercase">Acceso al CRM</span>
       </div>

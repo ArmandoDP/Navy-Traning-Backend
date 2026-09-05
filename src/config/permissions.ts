@@ -1,33 +1,48 @@
-// Nombres de módulos
+export type Role = 
+  | 'director' 
+  | 'finanzas' 
+  | 'gerente' 
+  | 'staff_navy' 
+  | 'staff_galley'
+
 export type ModuleName = 
-  | 'inicio'
-  | 'clientes'
+  | 'dashboard'
+  | 'checkin'
+  | 'the_galley'
+  | 'reservas'
   | 'clases'
-  | 'finanzas'
+  | 'sucursales'
+  | 'clientes'
   | 'staff'
+  | 'paquetes'
+  | 'finanzas'
+  | 'nomina'
+  | 'alertas'
+  | 'reportes'
+  | 'integraciones'
   | 'configuracion'
 
-export type Module = ModuleName
-
-// Roles del sistema
-export type Role = 'Admin' | 'Manager' | 'Coach' | 'Staff' | 'FrontDesk' | string
-
-// Matriz de permisos esperada por AuthContext
+/**
+ * Matriz de Permisos del CRM (Basado en PERMISOS CRM.xlsx)
+ * - director / finanzas: Acceso total
+ * - gerente: Acceso operativo limitado a su sucursal
+ * - staff_navy: Front Desk / Coach (Check-in, Reservas, Lectura de Clases/Clientes)
+ * - staff_galley: Exclusivo operación The Galley
+ */
 export const MODULE_PERMISSIONS: Record<ModuleName, Role[]> = {
-  inicio:        ['Admin', 'Manager', 'Coach', 'Staff', 'FrontDesk'],
-  clientes:      ['Admin', 'Manager', 'Coach', 'Staff', 'FrontDesk'],
-  clases:        ['Admin', 'Manager', 'Coach', 'Staff', 'FrontDesk'],
-  finanzas:      ['Admin', 'Manager'],
-  staff:         ['Admin', 'Manager'],
-  configuracion: ['Admin'],
-}
-
-// Alias por compatibilidad
-export const PERMISSIONS = MODULE_PERMISSIONS
-
-export function hasPermission(role: Role | null | undefined, module: ModuleName): boolean {
-  if (!role) return false
-  const allowedRoles = MODULE_PERMISSIONS[module]
-  if (!allowedRoles) return false
-  return allowedRoles.includes(role)
+  dashboard:     ['director', 'finanzas', 'gerente'],
+  checkin:       ['director', 'finanzas', 'gerente', 'staff_navy'],
+  the_galley:    ['director', 'finanzas', 'staff_galley'],
+  reservas:      ['director', 'finanzas', 'gerente', 'staff_navy'],
+  clases:        ['director', 'finanzas', 'gerente', 'staff_navy'],
+  sucursales:    ['director', 'finanzas', 'gerente'],
+  clientes:      ['director', 'finanzas', 'gerente', 'staff_navy'],
+  staff:         ['director', 'finanzas'],
+  paquetes:      ['director', 'finanzas'],
+  finanzas:      ['director', 'finanzas'],
+  nomina:        ['director', 'finanzas'],
+  alertas:       ['director', 'finanzas', 'gerente'],
+  reportes:      ['director', 'finanzas', 'gerente'],
+  integraciones: ['director', 'finanzas'],
+  configuracion: ['director', 'finanzas'],
 }
