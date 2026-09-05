@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
             <table width="500" cellpadding="0" cellspacing="0" style="background:#111;border-radius:20px;overflow:hidden;">
               <tr>
                 <td style="padding:36px;text-align:center;">
-                  <img src="https://crm.navytrainingcenter.com/logo-navy.svg" width="110" style="display:block;margin:0 auto 28px;" />
+                  <img src="https://knigqmxpenteolnwomir.supabase.co/storage/v1/object/public/staff-documentos/Group%2021.png" width="180" style="display:block;margin:0 auto 28px;" />
                   <p style="margin:0 0 8px;font-size:32px;">✓</p>
                   <p style="margin:0 0 12px;color:#fff;font-size:24px;font-weight:900;">Cuenta eliminada</p>
                   <p style="margin:0 0 28px;color:#6b7280;font-size:15px;line-height:24px;">

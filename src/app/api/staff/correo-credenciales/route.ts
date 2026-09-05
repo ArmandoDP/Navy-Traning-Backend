@@ -6,7 +6,7 @@ const resend = new Resend(process.env.RESEND_API_KEY)
 export async function POST(req: NextRequest) {
   const { email, nombre, password, empleado } = await req.json()
 
-  const logoUrl  = 'https://crm.navytrainingcenter.com/logo-navy.svg'
+  const logoUrl = 'https://knigqmxpenteolnwomir.supabase.co/storage/v1/object/public/staff-documentos/Group%2021.png'
   const sucursales = empleado?.staff_sucursales
     ?.map((ss: any) => ss.sucursales?.nombre)
     .filter(Boolean)

@@ -26,10 +26,15 @@ export async function POST(req: NextRequest) {
         <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:24px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
 
           <!-- Header negro -->
+          <!-- Header negro -->
           <tr>
             <td style="background:#171B24;padding:40px;text-align:center;">
-              <p style="margin:0;color:#fff;font-size:28px;font-weight:900;letter-spacing:-1px;">NAVY</p>
-              <p style="margin:4px 0 0;color:#9ca3af;font-size:11px;letter-spacing:4px;text-transform:uppercase;">Training Center</p>
+              <img 
+                src="https://knigqmxpenteolnwomir.supabase.co/storage/v1/object/public/staff-documentos/Group%2021.png" 
+                alt="NAVY Training Center" 
+                width="180" 
+                style="display: block; width: 180px; max-width: 100%; height: auto; margin: 0 auto; border: 0;"
+              />
             </td>
           </tr>
 

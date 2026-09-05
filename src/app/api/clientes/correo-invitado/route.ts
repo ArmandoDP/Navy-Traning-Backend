@@ -20,9 +20,13 @@ export async function POST(req: NextRequest) {
     html: `
       <div style="font-family:sans-serif;max-width:560px;margin:0 auto">
         <div style="background:#171B24;padding:32px;text-align:center;border-radius:16px 16px 0 0">
-          <p style="color:#fff;font-size:24px;font-weight:900;margin:0">NAVY</p>
-          <p style="color:#9ca3af;font-size:11px;letter-spacing:4px;margin:4px 0 0">TRAINING CENTER</p>
-        </div>
+  <img 
+    src="https://knigqmxpenteolnwomir.supabase.co/storage/v1/object/public/staff-documentos/Group%2021.png" 
+    alt="Navy Training Center" 
+    width="180" 
+    style="display: block; width: 180px; max-width: 100%; height: auto; margin: 0 auto; border: 0;"
+  />
+</div>
         <div style="background:#fff;padding:32px;border-radius:0 0 16px 16px;border:1px solid #f3f4f6">
           <h2 style="color:#111;font-size:22px;font-weight:900">¡Hola ${nombre}! 👋</h2>
           <p style="color:#6b7280;font-size:15px;line-height:24px">

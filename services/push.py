@@ -356,7 +356,7 @@ async def check_renovaciones_recurrentes():
           'subject': subject,
           'html':    f'''<div style="font-family:sans-serif;max-width:560px;margin:40px auto">
             <div style="background:#171B24;border-radius:20px 20px 0 0;padding:32px;text-align:center">
-              <p style="color:#fff;font-size:28px;font-weight:900;margin:0;letter-spacing:4px">NAVY</p>
+              <img src="https://knigqmxpenteolnwomir.supabase.co/storage/v1/object/public/staff-documentos/Group%2021.png" alt="NAVY Training Center" style="width:180px;max-width:100%;height:auto;margin:0 auto;display:block;border:0" />
             </div>
             <div style="background:#fff;padding:32px;border:1px solid #e5e7eb">
               <h2 style="color:#111">Hola {nombre} 👋</h2>
