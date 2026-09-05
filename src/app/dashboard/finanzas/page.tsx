@@ -1,12 +1,13 @@
 'use client'
 import { useState } from 'react'
-import { Download, Calendar } from 'lucide-react'
+import { Download, Calendar, Lock, RefreshCw } from 'lucide-react'
 import FinanzasResumen       from '@/components/finanzas/FinanzasResumen'
 import FinanzasIngresos      from '@/components/finanzas/FinanzasIngresos'
 import FinanzasTransacciones from '@/components/finanzas/FinanzasTransacciones'
 import FinanzasPagosFallidos from '@/components/finanzas/FinanzasPagosFallidos'
 import FinanzasNomina from '@/components/finanzas/FinanzasNomina'
 import { useSucursal } from '@/context/SucursalContext'
+import { useAuth } from '@/context/AuthContext'
 
 type Tab = 'resumen' | 'ingresos' | 'transacciones' | 'fallidos' | 'nomina'
 
@@ -24,13 +25,35 @@ const MESES = [
 ]
 
 export default function FinanzasPage() {
+  const { canAccess, loading: authLoading, role } = useAuth()
+  const { sucursalId } = useSucursal()
+
   const [tab,   setTab]   = useState<Tab>('resumen')
   const [mes,   setMes]   = useState(new Date().getMonth())
   const [anio,  setAnio]  = useState(new Date().getFullYear())
 
   const fechaInicio = new Date(anio, mes, 1).toISOString().split('T')[0]
   const fechaFin    = new Date(anio, mes + 1, 0).toISOString().split('T')[0]
-  const { sucursalId } = useSucursal()
+
+  if (authLoading) return (
+    <div className="flex items-center justify-center h-64 text-gray-400 gap-2">
+      <RefreshCw size={16} className="animate-spin" /> Cargando permisos...
+    </div>
+  )
+
+  if (!canAccess('finanzas')) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] bg-white border border-gray-100 rounded-3xl p-8 text-center shadow-sm">
+        <div className="w-16 h-16 bg-red-50 text-red-500 rounded-2xl flex items-center justify-center mb-4">
+          <Lock size={32} />
+        </div>
+        <h2 className="text-xl font-black text-gray-900 mb-1">Acceso restringido</h2>
+        <p className="text-sm text-gray-400 max-w-md">
+          Tu rol (<span className="font-bold text-gray-700">{role || 'Sin rol'}</span>) no tiene permisos para acceder al módulo de Finanzas.
+        </p>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-5">

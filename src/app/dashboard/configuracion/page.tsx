@@ -1,9 +1,10 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { supabase }            from '@/lib/supabase'
-import { Plus, RefreshCw, Settings, Bell, Users, Shield, Link } from 'lucide-react'
-import DrawerGerente           from '@/components/configuracion/DrawerGerente'
-import TabNotificaciones       from '@/components/configuracion/TabNotificaciones'
+import { supabase } from '@/lib/supabase'
+import { Plus, RefreshCw, Settings, Bell, Users, Shield, Link, Lock } from 'lucide-react'
+import DrawerGerente from '@/components/configuracion/DrawerGerente'
+import TabNotificaciones from '@/components/configuracion/TabNotificaciones'
+import { useAuth } from '@/context/AuthContext'
 
 type Tab = 'gerentes' | 'notificaciones' | 'segmentacion' | 'roles' | 'integraciones'
 
@@ -16,13 +17,15 @@ const TABS = [
 ]
 
 export default function ConfiguracionPage() {
+  const { canAccess, loading: authLoading, role } = useAuth()
+
   const [tab,           setTab]           = useState<Tab>('gerentes')
   const [gerentes,      setGerentes]      = useState<any[]>([])
   const [sucursales,    setSucursales]    = useState<any[]>([])
   const [loading,       setLoading]       = useState(true)
   const [drawerOpen,    setDrawerOpen]    = useState(false)
   const [gerenteActivo, setGerenteActivo] = useState<any>(null)
-  const [modalNotif, setModalNotif] = useState(false)
+  const [modalNotif,    setModalNotif]    = useState(false)
 
   const fetchData = async () => {
     setLoading(true)
@@ -56,6 +59,29 @@ export default function ConfiguracionPage() {
     return `rgba(${r},${g},${b},0.12)`
   }
 
+  // 1. Estado de carga de autenticación
+  if (authLoading) return (
+    <div className="flex items-center justify-center h-64 text-gray-400 gap-2">
+      <RefreshCw size={16} className="animate-spin" /> Cargando permisos...
+    </div>
+  )
+
+  // 2. Validación de acceso al módulo de configuración
+  if (!canAccess('configuracion')) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] bg-white border border-gray-100 rounded-3xl p-8 text-center shadow-sm">
+        <div className="w-16 h-16 bg-red-50 text-red-500 rounded-2xl flex items-center justify-center mb-4">
+          <Lock size={32} />
+        </div>
+        <h2 className="text-xl font-black text-gray-900 mb-1">Acceso restringido</h2>
+        <p className="text-sm text-gray-400 max-w-md">
+          Tu rol (<span className="font-bold text-gray-700">{role || 'Sin rol'}</span>) no tiene permisos para el módulo de Configuración.
+        </p>
+      </div>
+    )
+  }
+
+  // 3. Carga interna de datos de la página
   if (loading) return (
     <div className="flex items-center justify-center h-64 text-gray-400 gap-2">
       <RefreshCw size={16} className="animate-spin" /> Cargando configuración...
@@ -77,7 +103,6 @@ export default function ConfiguracionPage() {
             <Plus size={15} /> Nuevo gerente
           </button>
         )}
-        {/* En el header: */}
         {tab === 'notificaciones' && (
           <button onClick={() => setModalNotif(true)}
             className="flex items-center gap-2 bg-gray-900 text-white font-bold text-sm px-4 py-2.5 rounded-xl hover:bg-gray-800 transition">

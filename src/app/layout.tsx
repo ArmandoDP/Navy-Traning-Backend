@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import { Open_Sans, Radio_Canada_Big } from 'next/font/google'
+import { AuthProvider } from '@/context/AuthContext'
 import './globals.css'
 
 const openSans = Open_Sans({
@@ -24,7 +25,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="es">
       <body className={`${openSans.variable} ${radioCanada.variable} ${openSans.className}`}
         suppressHydrationWarning>
-        {children}
+          <AuthProvider> 
+            {children}
+          </AuthProvider>
       </body>
     </html>
   )

@@ -105,90 +105,125 @@ export default function DrawerNuevoEmpleado({ isOpen, onClose, onSuccess }: Prop
   }, [isOpen])
 
   const handleGuardar = async () => {
-    if (!form.nombre || !form.tipo) return
-    setLoading(true)
-    setToast(true)
-    onSuccess()
-    handleClose()
-
-    // 1. Crear staff
-    const { data: staffData, error: staffError } = await supabase
-      .from('staff')
-      .insert({
-        nombre:                  form.nombre,
-        primer_apellido:         form.primer_apellido,
-        segundo_apellido:        form.segundo_apellido,
-        rfc_identificacion:      form.rfc,
-        email:                   form.email,
-        telefono:                form.telefono,
-        fecha_ingreso:           form.fecha_ingreso || null,
-        estatus:                 form.estatus,
-        tipo:                    form.tipo,
-        nivel:                   isCoach ? form.nivel || null : null,
-        tarifa_hora:             form.tarifa_hora ? Number(form.tarifa_hora) : null,
-        sueldo_fijo:             form.sueldo_fijo ? Number(form.sueldo_fijo) : null,
-        aplica_bono_puntualidad: form.aplica_bono_puntualidad,
-        pago_en_efectivo:        form.pago_en_efectivo,
-        banco:                   form.banco,
-        cuenta_bancaria:         form.cuenta_bancaria,
-        bio:                     form.bio,
-        contacto_emergencia_nombre:   form.contacto_emergencia_nombre,
-        contacto_emergencia_relacion: form.contacto_emergencia_relacion,
-        contacto_emergencia_telefono: form.contacto_emergencia_telefono,
-      })
-      .select()
-      .single()
-
-    if (staffError || !staffData) {
-      alert('Error al crear staff: ' + staffError?.message)
-      setLoading(false)
+    if (!form.nombre || !form.tipo || !form.email) {
+      alert('Por favor completa los campos obligatorios (Nombre, Tipo y Correo).')
       return
     }
+    setLoading(true)
 
-    const staffId = staffData.id
+    try {
+      const emailLimpio = form.email.trim().toLowerCase()
 
-    // 2. Sucursales asignadas
-    if (form.sucursales_ids.length > 0) {
-      await supabase.from('staff_sucursales').insert(
-        form.sucursales_ids.map(sid => ({ staff_id: staffId, sucursal_id: sid }))
-      )
-    }
+      // 1. Crear el registro directo en la tabla 'staff'
+      const { data: staffData, error: staffError } = await supabase
+        .from('staff')
+        .insert({
+          nombre:                      form.nombre.trim(),
+          primer_apellido:             form.primer_apellido.trim(),
+          segundo_apellido:            form.segundo_apellido.trim(),
+          rfc_identificacion:          form.rfc,
+          email:                       emailLimpio,
+          telefono:                    form.telefono,
+          fecha_ingreso:               form.fecha_ingreso || null,
+          estatus:                     form.estatus,
+          tipo:                        form.tipo,
+          nivel:                       isCoach ? form.nivel || null : null,
+          tarifa_hora:                 form.tarifa_hora ? Number(form.tarifa_hora) : null,
+          sueldo_fijo:                 form.sueldo_fijo ? Number(form.sueldo_fijo) : null,
+          aplica_bono_puntualidad:     form.aplica_bono_puntualidad,
+          pago_en_efectivo:            form.pago_en_efectivo,
+          banco:                       form.banco,
+          cuenta_bancaria:             form.cuenta_bancaria,
+          bio:                         form.bio,
+          contacto_emergencia_nombre:   form.contacto_emergencia_nombre,
+          contacto_emergencia_relacion: form.contacto_emergencia_relacion,
+          contacto_emergencia_telefono: form.contacto_emergencia_telefono,
+        })
+        .select()
+        .single()
 
-    // 3. Categorías (solo coach)
-    if (isCoach && form.categorias.length > 0) {
-      await supabase.from('staff_categorias').insert(
-        form.categorias.map(cat => ({ staff_id: staffId, categoria: cat }))
-      )
-    }
+      if (staffError || !staffData) {
+        throw new Error(`Error al crear staff: ${staffError?.message}`)
+      }
 
-    // 4. Reglas de bono temporales
-    if (reglasTemp.length > 0) {
-      await supabase.from('staff_reglas_bono').insert(
-        reglasTemp.map(r => ({ ...r, staff_id: staffId }))
-      )
-    }
+      const staffId = staffData.id
 
-    // 5. Subir documentos
-    for (const doc of docs) {
-      if (!doc.file) continue
-      const ext  = doc.file.name.split('.').pop()
-      const path = `${staffId}/${doc.tipo.replace(/ /g, '_')}_${Date.now()}.${ext}`
-      const { data: storageData } = await supabase.storage
-        .from('staff-documentos')
-        .upload(path, doc.file, { upsert: true })
-      const { data: urlData } = supabase.storage
-        .from('staff-documentos').getPublicUrl(path)
-      await supabase.from('staff_documentos').insert({
-        staff_id:       staffId,
-        tipo:           doc.tipo,
-        url:            urlData.publicUrl,
-        nombre_archivo: doc.file.name,
+      // 2. Guardar relaciones (Sucursales, Categorías, Reglas de Bono)
+      if (form.sucursales_ids.length > 0) {
+        await supabase.from('staff_sucursales').insert(
+          form.sucursales_ids.map(sid => ({ staff_id: staffId, sucursal_id: sid }))
+        )
+      }
+
+      if (isCoach && form.categorias.length > 0) {
+        await supabase.from('staff_categorias').insert(
+          form.categorias.map(cat => ({ staff_id: staffId, categoria: cat }))
+        )
+      }
+
+      if (reglasTemp.length > 0) {
+        await supabase.from('staff_reglas_bono').insert(
+          reglasTemp.map(r => ({
+            categoria: r.categoria,
+            niveles: r.niveles,
+            min_asistentes: r.min_asistentes,
+            monto_bono: r.monto_bono,
+            staff_id: staffId
+          }))
+        )
+      }
+
+      // 3. Cargar archivos/documentos adjuntos
+      for (const doc of docs) {
+        if (!doc.file) continue
+        const ext  = doc.file.name.split('.').pop()
+        const path = `${staffId}/${doc.tipo.replace(/ /g, '_')}_${Date.now()}.${ext}`
+        
+        await supabase.storage
+          .from('staff-documentos')
+          .upload(path, doc.file, { upsert: true })
+        
+        const { data: urlData } = supabase.storage
+          .from('staff-documentos').getPublicUrl(path)
+
+        await supabase.from('staff_documentos').insert({
+          staff_id:       staffId,
+          tipo:           doc.tipo,
+          url:            urlData.publicUrl,
+          nombre_archivo: doc.file.name,
+        })
+      }
+
+      // Generar contraseña temporal segura
+      const tempPassword = Math.random().toString(36).slice(-8) + "N1!"
+
+      // 4. Delegar la creación del Auth User y envío del correo al Backend API Route
+      const res = await fetch('/api/staff/correo-credenciales', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: emailLimpio,
+          nombre: `${form.nombre} ${form.primer_apellido || ''}`.trim(),
+          password: tempPassword,
+          tipo: form.tipo,
+          staff_id: staffId,
+          empleado: staffData,
+        }),
       })
-    }
 
-    setLoading(false)
-    onSuccess()
-    handleClose()
+      if (!res.ok) {
+        const errorData = await res.json()
+        throw new Error(errorData.error || 'Error al procesar el usuario de autenticación.')
+      }
+
+      setToast(true)
+      onSuccess()
+      handleClose()
+    } catch (err: any) {
+      alert(err.message || 'Error al guardar el empleado')
+    } finally {
+      setLoading(false)
+    }
   }
 
   const handleClose = () => {
@@ -227,11 +262,11 @@ export default function DrawerNuevoEmpleado({ isOpen, onClose, onSuccess }: Prop
     <>
       {toast && (
         <ToastExito
-            titulo="Nuevo miembro del staff creado"
-            mensaje="El empleado se ha dado de alta exitosamente."
-            onClose={() => setToast(false)}
+          titulo="Nuevo miembro del staff creado"
+          mensaje="El empleado se ha dado de alta exitosamente."
+          onClose={() => setToast(false)}
         />
-        )}
+      )}
       {/* Overlay */}
       <div onClick={handleClose} className="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm" />
 
@@ -282,6 +317,7 @@ export default function DrawerNuevoEmpleado({ isOpen, onClose, onSuccess }: Prop
                 value={form.telefono} onChange={e => set('telefono', e.target.value)} />
             </Field>
           </div>
+          
 
           <div className="grid grid-cols-2 gap-3">
             <Field label="Fecha de ingreso">
@@ -656,7 +692,7 @@ function ModalReglaBonoPrev({
 
           <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-between">
             {regla?._tempId
-              ? <button onClick={() => { /* handled outside */ onClose() }} className="text-xs text-red-500 hover:text-red-700 font-medium">Eliminar regla</button>
+              ? <button onClick={() => { onClose() }} className="text-xs text-red-500 hover:text-red-700 font-medium">Eliminar regla</button>
               : <div />
             }
             <div className="flex gap-3">

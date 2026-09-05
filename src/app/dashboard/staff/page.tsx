@@ -1,9 +1,9 @@
-// app/dashboard/staff/page.tsx
 'use client'
 import { useEffect, useState } from 'react'
 import { supabase } from '@/lib/supabase'
 import { useSucursal } from '@/context/SucursalContext'
-import { Upload, Plus, RefreshCw } from 'lucide-react'
+import { useAuth } from '@/context/AuthContext'
+import { Upload, Plus, RefreshCw, Lock } from 'lucide-react'
 import StaffMetricas      from '../../../components/staff/StaffMetricas'
 import StaffTabla         from '../../../components/staff/StaffTabla'
 import DrawerNuevoEmpleado from '../../../components/staff/DrawerNuevoEmpleado'
@@ -11,6 +11,7 @@ import DrawerEditarEmpleado from '@/components/staff/DrawerEditarEmpleado'
 import DrawerStaff from '@/components/staff/drawer/DrawerStaff'
 
 export default function StaffPage() {
+  const { canAccess, loading: authLoading, role } = useAuth()
   const { sucursalId, sucursalActiva } = useSucursal()
 
   const [staff,      setStaff]      = useState<any[]>([])
@@ -21,10 +22,9 @@ export default function StaffPage() {
   const [drawerStaffId, setDrawerStaffId] = useState<string | null>(null)
   const [drawerOpen,    setDrawerOpen]    = useState(false)
 
-
-const coaches        = staff.filter(s => s.tipo === 'Coach' && s.estatus === 'Activo').length
-const staffOperativo = staff.filter(s => s.tipo !== 'Coach' && s.estatus === 'Activo').length
-const bonos = staff.reduce((acc, s) => acc + (s.bono_periodo || 0), 0)
+  const coaches        = staff.filter(s => s.tipo === 'Coach' && s.estatus === 'Activo').length
+  const staffOperativo = staff.filter(s => s.tipo !== 'Coach' && s.estatus === 'Activo').length
+  const bonos = staff.reduce((acc, s) => acc + (s.bono_periodo || 0), 0)
     
   const fetchStaff = async () => {
     setLoading(true)
@@ -74,6 +74,26 @@ const bonos = staff.reduce((acc, s) => acc + (s.bono_periodo || 0), 0)
     a.download = `staff-${new Date().toISOString().slice(0, 10)}.csv`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  if (authLoading) return (
+    <div className="flex items-center justify-center h-64 text-gray-400 gap-2">
+      <RefreshCw size={16} className="animate-spin" /> Cargando permisos...
+    </div>
+  )
+
+  if (!canAccess('staff')) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] bg-white border border-gray-100 rounded-3xl p-8 text-center shadow-sm">
+        <div className="w-16 h-16 bg-red-50 text-red-500 rounded-2xl flex items-center justify-center mb-4">
+          <Lock size={32} />
+        </div>
+        <h2 className="text-xl font-black text-gray-900 mb-1">Acceso restringido</h2>
+        <p className="text-sm text-gray-400 max-w-md">
+          Tu rol (<span className="font-bold text-gray-700">{role || 'Sin rol'}</span>) no tiene permisos para acceder al módulo de Staff.
+        </p>
+      </div>
+    )
   }
 
   if (loading) return (
