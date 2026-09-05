@@ -1,31 +1,39 @@
 'use client'
 import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 
 export default function ConfirmarEmailPage() {
+  const router = useRouter()
   const [status, setStatus] = useState<'loading' | 'success' | 'error'>('loading')
 
   useEffect(() => {
     const handleConfirm = async () => {
       const hash   = window.location.hash
-      const params = new URLSearchParams(hash.replace('#', ''))
+      const search = window.location.search
+      const params = new URLSearchParams(hash.replace('#', '') || search)
+      
       const type         = params.get('type')
       const accessToken  = params.get('access_token')
       const refreshToken = params.get('refresh_token')
 
-      // Si es recovery — redirigir a la app
-      if (type === 'recovery') {
-        window.location.href = `navyapp://auth/nueva-password${hash}`
+      // 1. Manejar Recuperación de Contraseña (Web / CRM / Localhost)
+      if (type === 'recovery' || hash.includes('type=recovery')) {
+        // Redirige directamente a la pantalla de cambiar contraseña en la Web/CRM
+        router.replace(`/login/nueva-password${hash}`)
         return
       }
 
-      // Si es signup — confirmar email
-      if (accessToken && type === 'signup') {
+      // 2. Manejar Registro / Confirmación de Email (Signup)
+      if (accessToken && (type === 'signup' || !type)) {
         const { error } = await supabase.auth.setSession({
           access_token:  accessToken,
           refresh_token: refreshToken || '',
         })
-        if (error) { setStatus('error'); return }
+        if (error) { 
+          setStatus('error')
+          return 
+        }
         setStatus('success')
         return
       }
@@ -39,11 +47,11 @@ export default function ConfirmarEmailPage() {
     }
 
     handleConfirm()
-  }, [])
+  }, [router])
 
   if (status === 'loading') return (
     <div style={{ minHeight: '100vh', backgroundColor: '#171B24', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <p style={{ color: '#fff', fontFamily: 'sans-serif' }}>Confirmando tu correo...</p>
+      <p style={{ color: '#fff', fontFamily: 'sans-serif' }}>Procesando solicitud...</p>
     </div>
   )
 
@@ -62,7 +70,7 @@ export default function ConfirmarEmailPage() {
       backgroundColor: '#171B24',
       display: 'flex',
       alignItems: 'center',
-      justifyContent: 'center',
+      justify: 'center',
       fontFamily: 'sans-serif',
       padding: '20px',
     }}>
@@ -75,10 +83,10 @@ export default function ConfirmarEmailPage() {
         textAlign: 'center',
       }}>
         <img 
-            src="/logo-navy.svg" 
-            alt="Navy Training Center" 
-            style={{ width: '140px', display: 'block', margin: '0 auto 40px' }} 
-          />
+          src="/logo-navy.svg" 
+          alt="Navy Training Center" 
+          style={{ width: '140px', display: 'block', margin: '0 auto 40px' }} 
+        />
 
         <div style={{
           width: '72px', height: '72px', borderRadius: '50%',
@@ -92,10 +100,10 @@ export default function ConfirmarEmailPage() {
           ¡Email confirmado!
         </h1>
         <p style={{ color: '#9ca3af', fontSize: '15px', lineHeight: '24px', margin: '0 0 40px' }}>
-          Tu cuenta está activa. Abre la app de Navy Training Center e inicia sesión con tu correo y contraseña.
+          Tu cuenta está activa. Inicia sesión con tu correo y contraseña.
         </p>
 
-        <a href="navyapp://"
+        <a href="/login"
           style={{
             display: 'block',
             backgroundColor: '#fff',
@@ -105,14 +113,9 @@ export default function ConfirmarEmailPage() {
             padding: '18px',
             borderRadius: '16px',
             textDecoration: 'none',
-            marginBottom: '16px',
           }}>
-          Abrir Navy App →
+          Ir al Inicio de Sesión →
         </a>
-
-        <p style={{ color: '#6b7280', fontSize: '12px', margin: 0 }}>
-          ¿No tienes la app? Descárgala en App Store o Google Play
-        </p>
       </div>
     </div>
   )

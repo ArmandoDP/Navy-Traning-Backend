@@ -27,40 +27,56 @@ export default function NuevaPasswordPage() {
   const [error,   setError]   = useState('')
   const [sesionOk, setSesionOk] = useState(false)
 
-  // Verificar que haya sesión activa (viene del link de email)
+  // Extraer token de la URL y autenticar la sesión
   useEffect(() => {
-  // 1. Verificar si hay sesión actual
-  supabase.auth.getSession().then(({ data }) => {
-    if (data.session) {
-      setSesionOk(true)
-    }
-  })
+    const inicializarSesion = async () => {
+      // 1. Extraer tokens del hash (#access_token=...&refresh_token=...)
+      const hash = window.location.hash
+      if (hash && hash.includes('access_token')) {
+        const params = new URLSearchParams(hash.replace('#', ''))
+        const accessToken  = params.get('access_token')
+        const refreshToken = params.get('refresh_token')
 
-  // 2. Escuchar cuando Supabase procese el token del hash de la URL
-  const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
-    if (event === 'PASSWORD_RECOVERY' || session) {
-      setSesionOk(true)
-      setEstado('idle')
-    }
-  })
+        if (accessToken) {
+          const { error: sessionErr } = await supabase.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken || '',
+          })
 
-  // Timeout de cortesía: Si tras 2.5 segundos no detectó sesión, marcar enlace inválido
-  const timer = setTimeout(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (!data.session) {
+          if (!sessionErr) {
+            setSesionOk(true)
+            setEstado('idle')
+            return
+          }
+        }
+      }
+
+      // 2. Si no hay hash, verificar si ya existía sesión activa
+      const { data } = await supabase.auth.getSession()
+      if (data.session) {
+        setSesionOk(true)
+      } else {
         setEstado('link-invalido')
       }
-    })
-  }, 2500)
+    }
 
-  return () => {
-    authListener.subscription.unsubscribe()
-    clearTimeout(timer)
-  }
-}, [])
+    inicializarSesion()
+
+    // Escuchar eventos de cambio de autenticación
+    const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY' || session) {
+        setSesionOk(true)
+        setEstado('idle')
+      }
+    })
+
+    return () => {
+      authListener.subscription.unsubscribe()
+    }
+  }, [])
 
   // Validaciones
-  const tieneMinimo  = pass.length >= 8
+  const tieneMinimo    = pass.length >= 8
   const tieneMayuscula = /[A-Z]/.test(pass)
   const tieneNumero    = /[0-9]/.test(pass)
   const coinciden      = pass === confirm && confirm !== ''
@@ -74,7 +90,7 @@ export default function NuevaPasswordPage() {
     const { error: err } = await supabase.auth.updateUser({ password: pass })
 
     if (err) {
-      setError('No se pudo actualizar la contraseña. El enlace puede haber expirado.')
+      setError(`No se pudo actualizar: ${err.message}`)
       setEstado('error')
     } else {
       setEstado('success')
@@ -83,7 +99,7 @@ export default function NuevaPasswordPage() {
   }
 
   // ── Link inválido ──
-  if (estado === 'link-invalido') return (
+  if (estado === 'link-invalido' && !sesionOk) return (
     <AuthCard>
       <AuthLogo />
       <div className="text-center space-y-4">
@@ -120,9 +136,6 @@ export default function NuevaPasswordPage() {
           <p className="text-gray-500 text-sm mt-2">
             Tu contraseña fue cambiada exitosamente. Redirigiendo al login...
           </p>
-        </div>
-        <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
-          <div className="bg-green-500 h-1.5 rounded-full animate-[width_3s_ease-in-out]" style={{ width: '100%' }} />
         </div>
         <Link href="/login"
           className="block text-sm text-indigo-600 hover:text-indigo-800 font-bold transition">
