@@ -23,6 +23,8 @@ async def get_booking_token(place_api_key: str) -> str:
         "place_api_key":   place_api_key,
       }
     )
+    print("TotalPass auth status:", res.status_code)
+    print("TotalPass auth body:", res.text)
     res.raise_for_status()
     return res.json()["token"]
 
