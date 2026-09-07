@@ -76,8 +76,8 @@ async def procesar_pago(req: PagoRequest):
       "metodo_pago":  "Tarjeta",
       "canal":        "Navy",
       "concepto":     f"{paquete['nombre']} — inscripción",
-      "orkestapay_payment_id": pago["payment_id"],
-      "orkestapay_order_id":   order_id,
+      "orkestapay_order_id": order_id,
+      "metadata":     { "orkestapay_payment_id": pago["payment_id"] },
     }).execute()
 
     # Desactivar membresía anterior
@@ -433,8 +433,8 @@ async def cobrar_tarjeta_endpoint(req: dict):
       "canal":                 "OrkestaPay",
       "concepto":              concepto,
       "fecha_pago":            date.today().isoformat(),
-      "orkestapay_payment_id": resultado.get("payment_id"),
       "orkestapay_order_id":   resultado.get("order_id"),
+      "metadata":              { "orkestapay_payment_id": resultado.get("payment_id") },
     }).execute()
 
     if not exitoso:
