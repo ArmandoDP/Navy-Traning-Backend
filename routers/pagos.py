@@ -364,6 +364,7 @@ async def listar_metodos_pago_endpoint(cliente_id: str):
 async def cobrar_tarjeta_endpoint(req: dict):
   from services.orkestapay import cobrar_tarjeta_guardada
   import uuid
+  from datetime import date
 
   cliente_id        = req.get("cliente_id")
   payment_method_id = req.get("payment_method_id")
@@ -377,14 +378,51 @@ async def cobrar_tarjeta_endpoint(req: dict):
   if not cli.data or not cli.data.get("orkestapay_customer_id"):
     raise HTTPException(status_code=400, detail="Cliente no tiene customer de OrkestaPay")
 
+  sucursal_id     = cli.data["sucursal_id"]
   idempotency_key = str(uuid.uuid4()).replace("-", "")
-  resultado = await cobrar_tarjeta_guardada(
-    sucursal_id       = cli.data["sucursal_id"],
-    customer_id       = cli.data["orkestapay_customer_id"],
-    payment_method_id = payment_method_id,
-    monto             = monto,
-    concepto          = concepto,
-    idempotency_key   = idempotency_key,
-  )
 
-  return { "ok": True, "payment_id": resultado.get("payment_id") }
+  try:
+    resultado = await cobrar_tarjeta_guardada(
+      sucursal_id       = sucursal_id,
+      customer_id       = cli.data["orkestapay_customer_id"],
+      payment_method_id = payment_method_id,
+      monto             = monto,
+      concepto          = concepto,
+      idempotency_key   = idempotency_key,
+    )
+
+    exitoso = resultado.get("status") == "COMPLETED"
+
+    supabase.table("pagos").insert({
+      "cliente_id":            cliente_id,
+      "sucursal_id":           sucursal_id,
+      "monto":                 monto,
+      "estatus":               "Completado" if exitoso else "Fallido",
+      "metodo_pago":           "Tarjeta",
+      "canal":                 "OrkestaPay",
+      "concepto":              concepto,
+      "fecha_pago":            date.today().isoformat(),
+      "orkestapay_payment_id": resultado.get("payment_id"),
+      "orkestapay_order_id":   resultado.get("order_id"),
+    }).execute()
+
+    if not exitoso:
+      raise HTTPException(status_code=400, detail="Pago no completado")
+
+    return { "ok": True, "payment_id": resultado.get("payment_id") }
+
+  except HTTPException:
+    raise
+  except Exception as e:
+    # Aunque truene la llamada a OrkestaPay, deja registro del intento fallido
+    supabase.table("pagos").insert({
+      "cliente_id":  cliente_id,
+      "sucursal_id": sucursal_id,
+      "monto":       monto,
+      "estatus":     "Fallido",
+      "metodo_pago": "Tarjeta",
+      "canal":       "OrkestaPay",
+      "concepto":    concepto,
+      "fecha_pago":  date.today().isoformat(),
+    }).execute()
+    raise HTTPException(status_code=500, detail=str(e))
