@@ -2,6 +2,7 @@ from fastapi        import APIRouter, HTTPException
 from pydantic       import BaseModel
 from services.orkestapay import get_access_token, crear_orden, registrar_pago, BASE_URL
 from services.supabase   import supabase
+from services.email      import enviar_comprobante_compra
 import uuid
 import httpx
 
@@ -75,8 +76,8 @@ async def procesar_pago(req: PagoRequest):
       "metodo_pago":  "Tarjeta",
       "canal":        "Navy",
       "concepto":     f"{paquete['nombre']} — inscripción",
-      "orkestapay_payment_id": pago["payment_id"],
-      "orkestapay_order_id":   order_id,
+      "orkestapay_order_id": order_id,
+      "metadata":     { "orkestapay_payment_id": pago["payment_id"] },
     }).execute()
 
     # Desactivar membresía anterior
@@ -93,6 +94,19 @@ async def procesar_pago(req: PagoRequest):
       "precio_pagado": req.monto,
       "origen":        "App",
     }).execute()
+
+    # 6. Comprobante por correo
+    try:
+      await enviar_comprobante_compra(
+        email       = cliente["email"],
+        nombre      = cliente["nombre"],
+        monto       = req.monto,
+        metodo_pago = "Tarjeta",
+        folio       = pago["payment_id"],
+        concepto    = f"{paquete['nombre']} — inscripción",
+      )
+    except Exception as e:
+      print("Error enviando comprobante (procesar):", e)
 
     return {
       "ok":         True,
@@ -182,6 +196,18 @@ async def crear_checkout(req: CrearCheckoutRequest):
 async def confirmar_checkout(req: ConfirmarCheckoutRequest):
   from datetime import date, timedelta
 
+  # Datos del cliente (para el comprobante)
+  cliente_res = supabase.table("clientes").select("nombre_completo, email").eq("id", req.cliente_id).single().execute()
+  if not cliente_res.data:
+    raise HTTPException(status_code=404, detail="Cliente no encontrado")
+  cliente = cliente_res.data
+
+  paquete_res = supabase.table("paquetes").select("nombre, vigencia_dias")\
+    .eq("id", req.paquete_id).single().execute()
+  paquete = paquete_res.data
+  if not paquete:
+    raise HTTPException(status_code=404, detail="Paquete no encontrado")
+
   # Buscar si tiene membresía activa
   memb_activa = supabase.table("membresias").select("fecha_fin")\
     .eq("cliente_id", req.cliente_id).eq("estatus", "Activa")\
@@ -189,21 +215,13 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
 
   # Si tiene membresía activa, la nueva empieza cuando termina la anterior
   if memb_activa.data:
-    from datetime import date
     fecha_fin_actual = date.fromisoformat(memb_activa.data[0]["fecha_fin"])
     hoy = date.today()
-    fecha_inicio = max(hoy, fecha_fin_actual).isoformat()  # la más lejana entre hoy y fin actual
+    fecha_inicio = max(hoy, fecha_fin_actual).isoformat()
   else:
     fecha_inicio = date.today().isoformat()
 
   fecha_fin = (date.fromisoformat(fecha_inicio) + timedelta(days=paquete.get("vigencia_dias", 30))).isoformat()
-
-  paquete_res = supabase.table("paquetes").select("nombre, vigencia_dias")\
-    .eq("id", req.paquete_id).single().execute()
-  paquete = paquete_res.data
-
-  fecha_inicio = date.today().isoformat()
-  fecha_fin    = (date.today() + timedelta(days=paquete.get("vigencia_dias", 30))).isoformat()
 
   # Guardar pago
   supabase.table("pagos").insert({
@@ -239,6 +257,19 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
     "paquete_id":     req.paquete_id,
     "fecha_venc_plan": fecha_fin,
   }).eq("id", req.cliente_id).execute()
+
+  # Comprobante por correo
+  try:
+    await enviar_comprobante_compra(
+      email       = cliente["email"],
+      nombre      = cliente["nombre_completo"],
+      monto       = req.monto,
+      metodo_pago = "Tarjeta",
+      folio       = req.order_id,
+      concepto    = f"{paquete['nombre']} — inscripción",
+    )
+  except Exception as e:
+    print("Error enviando comprobante (confirmar-checkout):", e)
 
   return { "ok": True }
 
@@ -363,6 +394,7 @@ async def listar_metodos_pago_endpoint(cliente_id: str):
 @router.post("/cobrar-tarjeta")
 async def cobrar_tarjeta_endpoint(req: dict):
   from services.orkestapay import cobrar_tarjeta_guardada
+  from datetime import date
   import uuid
 
   cliente_id        = req.get("cliente_id")
@@ -371,20 +403,70 @@ async def cobrar_tarjeta_endpoint(req: dict):
   concepto          = req.get("concepto", "Compra De Gali")
 
   cli = supabase.table("clientes")\
-    .select("orkestapay_customer_id, sucursal_id, nombre_completo")\
+    .select("orkestapay_customer_id, sucursal_id, nombre_completo, email")\
     .eq("id", cliente_id).single().execute()
 
   if not cli.data or not cli.data.get("orkestapay_customer_id"):
     raise HTTPException(status_code=400, detail="Cliente no tiene customer de OrkestaPay")
 
+  sucursal_id     = cli.data["sucursal_id"]
   idempotency_key = str(uuid.uuid4()).replace("-", "")
-  resultado = await cobrar_tarjeta_guardada(
-    sucursal_id       = cli.data["sucursal_id"],
-    customer_id       = cli.data["orkestapay_customer_id"],
-    payment_method_id = payment_method_id,
-    monto             = monto,
-    concepto          = concepto,
-    idempotency_key   = idempotency_key,
-  )
 
-  return { "ok": True, "payment_id": resultado.get("payment_id") }
+  try:
+    resultado = await cobrar_tarjeta_guardada(
+      sucursal_id       = sucursal_id,
+      customer_id       = cli.data["orkestapay_customer_id"],
+      payment_method_id = payment_method_id,
+      monto             = monto,
+      concepto          = concepto,
+      idempotency_key   = idempotency_key,
+    )
+
+    exitoso = resultado.get("status") == "COMPLETED"
+
+    supabase.table("pagos").insert({
+      "cliente_id":            cliente_id,
+      "sucursal_id":           sucursal_id,
+      "monto":                 monto,
+      "estatus":               "Completado" if exitoso else "Fallido",
+      "metodo_pago":           "Tarjeta",
+      "canal":                 "OrkestaPay",
+      "concepto":              concepto,
+      "fecha_pago":            date.today().isoformat(),
+      "orkestapay_order_id":   resultado.get("order_id"),
+      "metadata":              { "orkestapay_payment_id": resultado.get("payment_id") },
+    }).execute()
+
+    if not exitoso:
+      raise HTTPException(status_code=400, detail="Pago no completado")
+
+    # Comprobante por correo
+    try:
+      await enviar_comprobante_compra(
+        email       = cli.data.get("email"),
+        nombre      = cli.data.get("nombre_completo"),
+        monto       = monto,
+        metodo_pago = "Tarjeta guardada",
+        folio       = resultado.get("payment_id"),
+        concepto    = concepto,
+      )
+    except Exception as e:
+      print("Error enviando comprobante (cobrar-tarjeta):", e)
+
+    return { "ok": True, "payment_id": resultado.get("payment_id") }
+
+  except HTTPException:
+    raise
+  except Exception as e:
+    # Aunque truene la llamada a OrkestaPay, deja registro del intento fallido
+    supabase.table("pagos").insert({
+      "cliente_id":  cliente_id,
+      "sucursal_id": sucursal_id,
+      "monto":       monto,
+      "estatus":     "Fallido",
+      "metodo_pago": "Tarjeta",
+      "canal":       "OrkestaPay",
+      "concepto":    concepto,
+      "fecha_pago":  date.today().isoformat(),
+    }).execute()
+    raise HTTPException(status_code=500, detail=str(e))
