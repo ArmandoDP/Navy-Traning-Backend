@@ -5,13 +5,16 @@ from services.supabase   import supabase
 from services.email      import enviar_comprobante_compra
 import uuid
 import httpx
+import os
 
 router = APIRouter()
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://crm.navytrainingcenter.com")
 
 class PagoRequest(BaseModel):
   cliente_id:        str
   paquete_id:        str
-  payment_method_id: str   # token de tarjeta del WebView
+  payment_method_id: str
   device_session_id: str
   monto:             float
 
@@ -21,70 +24,105 @@ class ConfirmarCheckoutRequest(BaseModel):
   checkout_id: str
   order_id:    str
   monto:       float
+
 class PagarPenalizacionRequest(BaseModel):
   cliente_id:       str
   penalizacion_id:  str
 
 class CrearCheckoutRequest(BaseModel):
-  cliente_id:        str
-  paquete_id:        str
-  sucursal_id:       str  # ← agrega
-  payment_method_id: str = ''
-  device_session_id: str = ''
-  monto:             float
-  allow_save_payment_methods: bool = True 
+  cliente_id:                 str
+  paquete_id:                 str
+  sucursal_id:                str
+  payment_method_id:          str = ''
+  device_session_id:          str = ''
+  monto:                      float
+  allow_save_payment_methods: bool = True
 
-  
+
+async def _enviar_comprobante_app(
+  email: str, nombre: str, paquete: dict,
+  fecha_inicio: str, fecha_fin: str,
+  monto: float, order_id: str,
+  sucursal_nombre: str, tiene_membresia_previa: bool,
+):
+  """Llama al endpoint de Next.js que genera el correo comprobante dark premium."""
+  try:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+      res = await client.post(
+        f"{FRONTEND_URL}/api/correo/comprobante-pago",
+        json={
+          "email":                  email,
+          "nombre":                 nombre,
+          "paquete_nombre":         paquete.get("nombre"),
+          "vigencia_dias":          paquete.get("vigencia_dias", 30),
+          "clases_incluidas":       paquete.get("clases_incluidas"),
+          "acceso_total":           paquete.get("acceso_total", False),
+          "acceso_sucursal_hermana":paquete.get("acceso_sucursal_hermana", False),
+          "es_recurrente":          paquete.get("es_recurrente", False),
+          "descripcion":            paquete.get("descripcion"),
+          "fecha_inicio":           fecha_inicio,
+          "fecha_fin":              fecha_fin,
+          "monto":                  monto,
+          "metodo_pago":            "Tarjeta",
+          "referencia":             order_id,
+          "sucursal_nombre":        sucursal_nombre,
+          "tiene_membresia_previa": tiene_membresia_previa,
+          "folio":                  order_id,
+        },
+      )
+      print("Comprobante app status:", res.status_code)
+  except Exception as e:
+    print("Error enviando comprobante app:", e)
+
+
 @router.post("/procesar")
 async def procesar_pago(req: PagoRequest):
-  # 1. Traer datos del cliente y paquete
-  cliente_res = supabase.table("clientes").select("nombre_completo, email").eq("id", req.cliente_id).single().execute()
-  paquete_res = supabase.table("paquetes").select("id, nombre, vigencia_dias").eq("id", req.paquete_id).single().execute()
+  cliente_res = supabase.table("clientes").select("nombre_completo, email, sucursal_id")\
+    .eq("id", req.cliente_id).single().execute()
+  paquete_res = supabase.table("paquetes")\
+    .select("id, nombre, vigencia_dias, clases_incluidas, acceso_total, acceso_sucursal_hermana, es_recurrente, descripcion")\
+    .eq("id", req.paquete_id).single().execute()
 
   if not cliente_res.data or not paquete_res.data:
     raise HTTPException(status_code=404, detail="Cliente o paquete no encontrado")
 
-  cliente = { "nombre": cliente_res.data["nombre_completo"], "email": cliente_res.data["email"] }
+  cliente = cliente_res.data
   paquete = paquete_res.data
+
+  sucursal_res = supabase.table("sucursales").select("nombre")\
+    .eq("id", cliente.get("sucursal_id", "")).single().execute()
+  sucursal_nombre = sucursal_res.data["nombre"] if sucursal_res.data else "Navy Training Center"
 
   merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
   idempotency_key   = str(uuid.uuid4()).replace("-", "")
 
   try:
-    # 2. Obtener token de OrkestaPay
-    token = await get_access_token()
-
-    # 3. Crear orden
-    orden = await crear_orden(token, cliente, paquete, req.monto, merchant_order_id)
+    token  = await get_access_token()
+    orden  = await crear_orden(token, {"nombre": cliente["nombre_completo"], "email": cliente["email"]}, paquete, req.monto, merchant_order_id)
     order_id = orden["order_id"]
-
-    # 4. Registrar pago
-    pago = await registrar_pago(token, order_id, req.payment_method_id, req.device_session_id, idempotency_key)
+    pago   = await registrar_pago(token, order_id, req.payment_method_id, req.device_session_id, idempotency_key)
 
     if pago["status"] != "COMPLETED":
       raise HTTPException(status_code=400, detail="Pago no completado")
 
-    # 5. Guardar en Supabase
     from datetime import date, timedelta
     fecha_inicio = date.today().isoformat()
     fecha_fin    = (date.today() + timedelta(days=paquete.get("vigencia_dias", 30))).isoformat()
 
     supabase.table("pagos").insert({
-      "cliente_id":   req.cliente_id,
-      "monto":        req.monto,
-      "estatus":      "Completado",
-      "metodo_pago":  "Tarjeta",
-      "canal":        "Navy",
-      "concepto":     f"{paquete['nombre']} — inscripción",
+      "cliente_id":        req.cliente_id,
+      "monto":             req.monto,
+      "estatus":           "Completado",
+      "metodo_pago":       "Tarjeta",
+      "canal":             "Navy",
+      "concepto":          f"{paquete['nombre']} — inscripción",
       "orkestapay_order_id": order_id,
-      "metadata":     { "orkestapay_payment_id": pago["payment_id"] },
+      "metadata":          {"orkestapay_payment_id": pago["payment_id"]},
     }).execute()
 
-    # Desactivar membresía anterior
-    supabase.table("membresias").update({ "estatus": "Inactiva" })\
+    supabase.table("membresias").update({"estatus": "Inactiva"})\
       .eq("cliente_id", req.cliente_id).eq("estatus", "Activa").execute()
 
-    # Crear nueva membresía
     supabase.table("membresias").insert({
       "cliente_id":    req.cliente_id,
       "paquete_id":    req.paquete_id,
@@ -95,25 +133,19 @@ async def procesar_pago(req: PagoRequest):
       "origen":        "App",
     }).execute()
 
-    # 6. Comprobante por correo
-    try:
-      await enviar_comprobante_compra(
-        email       = cliente["email"],
-        nombre      = cliente["nombre"],
-        monto       = req.monto,
-        metodo_pago = "Tarjeta",
-        folio       = pago["payment_id"],
-        concepto    = f"{paquete['nombre']} — inscripción",
-      )
-    except Exception as e:
-      print("Error enviando comprobante (procesar):", e)
+    await _enviar_comprobante_app(
+      email                  = cliente["email"],
+      nombre                 = cliente["nombre_completo"],
+      paquete                = paquete,
+      fecha_inicio           = fecha_inicio,
+      fecha_fin              = fecha_fin,
+      monto                  = req.monto,
+      order_id               = order_id,
+      sucursal_nombre        = sucursal_nombre,
+      tiene_membresia_previa = False,
+    )
 
-    return {
-      "ok":         True,
-      "payment_id": pago["payment_id"],
-      "order_id":   order_id,
-      "fecha_fin":  fecha_fin,
-    }
+    return {"ok": True, "payment_id": pago["payment_id"], "order_id": order_id, "fecha_fin": fecha_fin}
 
   except HTTPException:
     raise
@@ -132,35 +164,27 @@ async def crear_checkout(req: CrearCheckoutRequest):
     .eq("id", req.cliente_id).single().execute()
   cliente     = cliente_res.data
 
-  # Obtener o crear customer en OrkestaPay
   customer_id = cliente.get("orkestapay_customer_id")
   if not customer_id:
     customer_id = await crear_customer(req.sucursal_id, cliente)
-    supabase.table("clientes").update({
-      "orkestapay_customer_id": customer_id
-    }).eq("id", req.cliente_id).execute()
+    supabase.table("clientes").update({"orkestapay_customer_id": customer_id})\
+      .eq("id", req.cliente_id).execute()
 
   token, keys = await get_access_token_sucursal(req.sucursal_id)
-  
-  ambiente = keys["ambiente"]
-  base_url = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
-
+  ambiente    = keys["ambiente"]
+  base_url    = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
   merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
 
   async with httpx.AsyncClient(timeout=30.0) as client:
     res = await client.post(
       f"{base_url}/checkouts",
-      headers={
-        "Authorization": f"Bearer {token}",
-        "Accept":        "application/json",
-        "Content-Type":  "application/json",
-      },
+      headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
       json={
-        "completed_redirect_url":     "https://crm.navytrainingcenter.com/pago/completado",
-        "canceled_redirect_url":      "https://crm.navytrainingcenter.com/pago/cancelado",
+        "completed_redirect_url":     f"{FRONTEND_URL}/pago/completado",
+        "canceled_redirect_url":      f"{FRONTEND_URL}/pago/cancelado",
         "allow_save_payment_methods": req.allow_save_payment_methods,
-        "customer_id":                customer_id,  # ← agrega esto
-        "locale": "ES_LATAM",
+        "customer_id":                customer_id,
+        "locale":                     "ES_LATAM",
         "order": {
           "merchant_order_id": merchant_order_id,
           "currency":          "MXN",
@@ -177,9 +201,9 @@ async def crear_checkout(req: CrearCheckoutRequest):
             "first_name": cliente["nombre_completo"].split()[0],
             "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
             "email":      cliente["email"],
-          }
-        }
-      }
+          },
+        },
+      },
     )
     print("Checkout response:", res.status_code, res.text)
     res.raise_for_status()
@@ -196,24 +220,33 @@ async def crear_checkout(req: CrearCheckoutRequest):
 async def confirmar_checkout(req: ConfirmarCheckoutRequest):
   from datetime import date, timedelta
 
-  # Datos del cliente (para el comprobante)
-  cliente_res = supabase.table("clientes").select("nombre_completo, email").eq("id", req.cliente_id).single().execute()
+  # Cliente
+  cliente_res = supabase.table("clientes").select("nombre_completo, email, sucursal_id")\
+    .eq("id", req.cliente_id).single().execute()
   if not cliente_res.data:
     raise HTTPException(status_code=404, detail="Cliente no encontrado")
   cliente = cliente_res.data
 
-  paquete_res = supabase.table("paquetes").select("nombre, vigencia_dias")\
-    .eq("id", req.paquete_id).single().execute()
+  # Sucursal
+  sucursal_res = supabase.table("sucursales").select("nombre")\
+    .eq("id", cliente.get("sucursal_id", "")).single().execute()
+  sucursal_nombre = sucursal_res.data["nombre"] if sucursal_res.data else "Navy Training Center"
+
+  # Paquete con todos los campos para el correo
+  paquete_res = supabase.table("paquetes").select(
+    "nombre, vigencia_dias, clases_incluidas, acceso_total, acceso_sucursal_hermana, es_recurrente, descripcion"
+  ).eq("id", req.paquete_id).single().execute()
   paquete = paquete_res.data
   if not paquete:
     raise HTTPException(status_code=404, detail="Paquete no encontrado")
 
-  # Buscar si tiene membresía activa
+  # Membresía activa → cola o activa inmediata
   memb_activa = supabase.table("membresias").select("fecha_fin")\
     .eq("cliente_id", req.cliente_id).eq("estatus", "Activa")\
     .order("fecha_fin", desc=True).limit(1).execute()
 
-  # Si tiene membresía activa, la nueva empieza cuando termina la anterior
+  tiene_membresia_previa = bool(memb_activa.data)
+
   if memb_activa.data:
     fecha_fin_actual = date.fromisoformat(memb_activa.data[0]["fecha_fin"])
     hoy = date.today()
@@ -225,22 +258,18 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
 
   # Guardar pago
   supabase.table("pagos").insert({
-    "cliente_id":              req.cliente_id,
-    "monto":                   req.monto,
-    "estatus":                 "Completado",
-    "metodo_pago":             "Tarjeta",
-    "canal":                   "Navy",
-    "concepto":                f"{paquete['nombre']} — inscripción",
-    "fecha_pago":              date.today().isoformat(),
-    "orkestapay_checkout_id":  req.checkout_id,
-    "orkestapay_order_id":     req.order_id,
+    "cliente_id":             req.cliente_id,
+    "monto":                  req.monto,
+    "estatus":                "Completado",
+    "metodo_pago":            "Tarjeta",
+    "canal":                  "Navy",
+    "concepto":               f"{paquete['nombre']} — inscripción",
+    "fecha_pago":             date.today().isoformat(),
+    "orkestapay_checkout_id": req.checkout_id,
+    "orkestapay_order_id":    req.order_id,
   }).execute()
 
-  # Desactivar membresía anterior
-  # supabase.table("membresias").update({ "estatus": "Inactiva" })\
-  #   .eq("cliente_id", req.cliente_id).eq("estatus", "Activa").execute()
-
-  # Crear nueva membresía
+  # Crear membresía
   supabase.table("membresias").insert({
     "cliente_id":    req.cliente_id,
     "paquete_id":    req.paquete_id,
@@ -253,25 +282,26 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
 
   # Actualizar cliente
   supabase.table("clientes").update({
-    "plan":           paquete["nombre"],
-    "paquete_id":     req.paquete_id,
+    "plan":            paquete["nombre"],
+    "paquete_id":      req.paquete_id,
     "fecha_venc_plan": fecha_fin,
   }).eq("id", req.cliente_id).execute()
 
-  # Comprobante por correo
-  try:
-    await enviar_comprobante_compra(
-      email       = cliente["email"],
-      nombre      = cliente["nombre_completo"],
-      monto       = req.monto,
-      metodo_pago = "Tarjeta",
-      folio       = req.order_id,
-      concepto    = f"{paquete['nombre']} — inscripción",
-    )
-  except Exception as e:
-    print("Error enviando comprobante (confirmar-checkout):", e)
+  # Comprobante premium
+  await _enviar_comprobante_app(
+    email                  = cliente["email"],
+    nombre                 = cliente["nombre_completo"],
+    paquete                = paquete,
+    fecha_inicio           = fecha_inicio,
+    fecha_fin              = fecha_fin,
+    monto                  = req.monto,
+    order_id               = req.order_id,
+    sucursal_nombre        = sucursal_nombre,
+    tiene_membresia_previa = tiene_membresia_previa,
+  )
 
-  return { "ok": True }
+  return {"ok": True}
+
 
 @router.post("/pagar-penalizacion")
 async def pagar_penalizacion(req: PagarPenalizacionRequest):
@@ -279,8 +309,7 @@ async def pagar_penalizacion(req: PagarPenalizacionRequest):
 
   pen_res = supabase.table("penalizaciones_noshow")\
     .select("*, clientes(nombre_completo, email, sucursal_id)")\
-    .eq("id", req.penalizacion_id)\
-    .eq("estatus", "Pendiente")\
+    .eq("id", req.penalizacion_id).eq("estatus", "Pendiente")\
     .single().execute()
 
   if not pen_res.data:
@@ -290,22 +319,20 @@ async def pagar_penalizacion(req: PagarPenalizacionRequest):
   monto   = pen["monto"]
   cliente = pen["clientes"]
 
-  # ← Usar keys de la sucursal del cliente
   sucursal_id = cliente["sucursal_id"]
   token, keys = await get_access_token_sucursal(sucursal_id)
   ambiente    = keys["ambiente"]
   base_url    = "https://api.orkestapay.com/v1" if ambiente == "production" else "https://api.sand.orkestapay.com/v1"
-
   merchant_order_id = str(uuid.uuid4()).replace("-", "")[:16]
 
   async with httpx.AsyncClient(timeout=30.0) as client:
     res = await client.post(
       f"{base_url}/checkouts",
-      headers={ "Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json" },
+      headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
       json={
-        "completed_redirect_url": "https://crm.navytrainingcenter.com/pago/completado",
-        "canceled_redirect_url":  "https://crm.navytrainingcenter.com/pago/cancelado",
-        "allow_save_payment_methods": req.allow_save_payment_methods,
+        "completed_redirect_url": f"{FRONTEND_URL}/pago/completado",
+        "canceled_redirect_url":  f"{FRONTEND_URL}/pago/cancelado",
+        "allow_save_payment_methods": False,
         "locale": "ES_LATAM",
         "order": {
           "merchant_order_id": merchant_order_id,
@@ -313,41 +340,33 @@ async def pagar_penalizacion(req: PagarPenalizacionRequest):
           "subtotal_amount":   monto,
           "total_amount":      monto,
           "country_code":      "MX",
-          "products": [{
-            "product_id": req.penalizacion_id,
-            "name":       "Penalización No Show",
-            "quantity":   1,
-            "unit_price": monto,
-          }],
+          "products": [{"product_id": req.penalizacion_id, "name": "Penalización No Show", "quantity": 1, "unit_price": monto}],
           "customer": {
             "first_name": cliente["nombre_completo"].split()[0],
             "last_name":  " ".join(cliente["nombre_completo"].split()[1:]) or "N/A",
             "email":      cliente["email"],
-          }
-        }
-      }
+          },
+        },
+      },
     )
     res.raise_for_status()
     data = res.json()
 
-  return {
-    "checkout_url": data["checkout_redirect_url"],
-    "checkout_id":  data["checkout_id"],
-    "order_id":     data["order"]["order_id"],
-  }
+  return {"checkout_url": data["checkout_redirect_url"], "checkout_id": data["checkout_id"], "order_id": data["order"]["order_id"]}
+
 
 @router.post("/confirmar-penalizacion")
 async def confirmar_penalizacion(req: dict):
   penalizacion_id = req.get("penalizacion_id")
-  checkout_id     = req.get("checkout_id")
   order_id        = req.get("order_id")
 
   supabase.table("penalizaciones_noshow").update({
-    "estatus":                "Pagado",
-    "orkestapay_payment_id":  order_id,
+    "estatus":               "Pagado",
+    "orkestapay_payment_id": order_id,
   }).eq("id", penalizacion_id).execute()
 
-  return { "ok": True }
+  return {"ok": True}
+
 
 @router.post("/crear-customer")
 async def crear_customer_endpoint(req: dict):
@@ -360,42 +379,36 @@ async def crear_customer_endpoint(req: dict):
   if not cli.data:
     raise HTTPException(status_code=404, detail="Cliente no encontrado")
 
-  # Si ya tiene customer_id, regresar ese
   if cli.data.get("orkestapay_customer_id"):
-    return { "customer_id": cli.data["orkestapay_customer_id"] }
+    return {"customer_id": cli.data["orkestapay_customer_id"]}
 
-  # Crear en OrkestaPay
   from services.orkestapay import crear_customer
   customer_id = await crear_customer(sucursal_id, cli.data)
 
-  # Guardar en DB
-  supabase.table("clientes").update({
-    "orkestapay_customer_id": customer_id
-  }).eq("id", cliente_id).execute()
+  supabase.table("clientes").update({"orkestapay_customer_id": customer_id})\
+    .eq("id", cliente_id).execute()
 
-  return { "customer_id": customer_id }
+  return {"customer_id": customer_id}
 
 
 @router.get("/metodos-pago/{cliente_id}")
 async def listar_metodos_pago_endpoint(cliente_id: str):
   from services.orkestapay import listar_metodos_pago
 
-  cli = supabase.table("clientes")\
-    .select("orkestapay_customer_id, sucursal_id")\
+  cli = supabase.table("clientes").select("orkestapay_customer_id, sucursal_id")\
     .eq("id", cliente_id).single().execute()
 
   if not cli.data or not cli.data.get("orkestapay_customer_id"):
-    return { "metodos": [] }
+    return {"metodos": []}
 
   metodos = await listar_metodos_pago(cli.data["sucursal_id"], cli.data["orkestapay_customer_id"])
-  return { "metodos": metodos }
+  return {"metodos": metodos}
 
 
 @router.post("/cobrar-tarjeta")
 async def cobrar_tarjeta_endpoint(req: dict):
   from services.orkestapay import cobrar_tarjeta_guardada
   from datetime import date
-  import uuid
 
   cliente_id        = req.get("cliente_id")
   payment_method_id = req.get("payment_method_id")
@@ -425,22 +438,22 @@ async def cobrar_tarjeta_endpoint(req: dict):
     exitoso = resultado.get("status") == "COMPLETED"
 
     supabase.table("pagos").insert({
-      "cliente_id":            cliente_id,
-      "sucursal_id":           sucursal_id,
-      "monto":                 monto,
-      "estatus":               "Completado" if exitoso else "Fallido",
-      "metodo_pago":           "Tarjeta",
-      "canal":                 "OrkestaPay",
-      "concepto":              concepto,
-      "fecha_pago":            date.today().isoformat(),
-      "orkestapay_order_id":   resultado.get("order_id"),
-      "metadata":              { "orkestapay_payment_id": resultado.get("payment_id") },
+      "cliente_id":          cliente_id,
+      "sucursal_id":         sucursal_id,
+      "monto":               monto,
+      "estatus":             "Completado" if exitoso else "Fallido",
+      "metodo_pago":         "Tarjeta",
+      "canal":               "OrkestaPay",
+      "concepto":            concepto,
+      "fecha_pago":          date.today().isoformat(),
+      "orkestapay_order_id": resultado.get("order_id"),
+      "metadata":            {"orkestapay_payment_id": resultado.get("payment_id")},
     }).execute()
 
     if not exitoso:
       raise HTTPException(status_code=400, detail="Pago no completado")
 
-    # Comprobante por correo
+    # Comprobante simple para cobros de Gali
     try:
       await enviar_comprobante_compra(
         email       = cli.data.get("email"),
@@ -453,12 +466,11 @@ async def cobrar_tarjeta_endpoint(req: dict):
     except Exception as e:
       print("Error enviando comprobante (cobrar-tarjeta):", e)
 
-    return { "ok": True, "payment_id": resultado.get("payment_id") }
+    return {"ok": True, "payment_id": resultado.get("payment_id")}
 
   except HTTPException:
     raise
   except Exception as e:
-    # Aunque truene la llamada a OrkestaPay, deja registro del intento fallido
     supabase.table("pagos").insert({
       "cliente_id":  cliente_id,
       "sucursal_id": sucursal_id,
