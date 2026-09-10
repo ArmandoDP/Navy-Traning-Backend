@@ -56,12 +56,10 @@ async def totalpass_booking_webhook(request: Request):
     if not slot_id:
       return { "received": True, "error": "slot_id faltante" }
 
-    # Buscar clase para obtener sucursal
     clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
     clase = clase_res.data
 
-    # Obtener place_api_key de la sucursal de la clase
     if clase and clase.get("sucursal_id"):
       place_api_key = get_place_api_key(clase["sucursal_id"])
     else:
@@ -170,7 +168,7 @@ async def publicar_clase_totalpass(req: dict):
     sucursal_id = req.get("sucursal_id")
     nombre      = req.get("nombre")
     descripcion = req.get("descripcion", "")
-    horario     = req.get("horario")  # ISO string
+    horario     = req.get("horario")  # ISO string UTC
     duracion    = req.get("duracion_minutos", 60)
     capacidad   = req.get("capacidad_max", 10)
     coach       = req.get("coach", "Navy Coach")
@@ -179,7 +177,7 @@ async def publicar_clase_totalpass(req: dict):
     sucursal_res = supabase.table("sucursales")\
       .select("totalpass_place_api_key, totalpass_plan_id")\
       .eq("id", sucursal_id).single().execute()
-    
+
     sucursal = sucursal_res.data
     if not sucursal or not sucursal.get("totalpass_place_api_key"):
       raise HTTPException(status_code=404, detail="No hay TotalPass key para esta sucursal")
@@ -188,53 +186,57 @@ async def publicar_clase_totalpass(req: dict):
     if not plan_id:
       raise HTTPException(status_code=400, detail="No hay planId de TotalPass para esta sucursal")
 
-    # Auth
     place_api_key = sucursal["totalpass_place_api_key"]
     token = await get_booking_token(place_api_key)
 
-    # Parsear horario
-    from datetime import datetime
-    dt = datetime.fromisoformat(horario.replace("Z", "+00:00"))
-    fecha_str = dt.strftime("%Y-%m-%d")
-    hora_str  = dt.strftime("%I:%M %p")  # 12h format requerido por TotalPass
-    weekday   = dt.weekday()  # 0=lunes, 6=domingo
+    # Convertir horario UTC → CDMX (UTC-6)
+    from datetime import datetime, timedelta
+    dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
+    dt_cdmx = dt_utc - timedelta(hours=6)
+
+    event_date = dt_cdmx.strftime("%Y-%m-%d")   # "2026-09-10"
+    start_time = dt_cdmx.strftime("%I:%M %p")   # "07:55 AM"
+
+    print(f"Publicando en TotalPass: {nombre} | {event_date} {start_time}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
       res = await client.post(
-        f"{BOOKING_BASE_URL}/partner/events",
-        headers={ "Authorization": f"Bearer {token}", "Content-Type": "application/json" },
+        f"{BOOKING_BASE_URL}/partner/event-occurrence",  # ← endpoint correcto
+        headers={
+          "Authorization": f"Bearer {token}",
+          "Content-Type":  "application/json",
+          "accept":        "application/json",
+        },
         json={
           "title":       nombre,
           "responsible": coach,
           "duration":    duracion,
           "slots":       capacidad,
           "planId":      plan_id,
+          "eventDate":   event_date,
+          "startTime":   start_time,
           "timezone":    "es-MX",
-          "startDate":   fecha_str,
-          "endDate":     fecha_str,
+          "status":      "ACTIVE",
           "description": descripcion or nombre,
-          "frequencyOptions": [{
-            "weekday":   weekday,
-            "startTime": [hora_str],
-          }]
         }
       )
       print("TotalPass publicar clase:", res.status_code, res.text)
       res.raise_for_status()
       data = res.json()
 
-    # Guardar occurrence_uuid en la clase
-    occurrence_uuid = None
-    occurrences = data.get("EventOccurrences", [])
-    if occurrences:
-      occurrence_uuid = occurrences[0].get("occurrenceUuid")
+    # Leer occurrenceUuid del response
+    occurrence_uuid = data.get("eventOccurrenceUuid")
 
     if clase_id and occurrence_uuid:
       supabase.table("clases").update({
         "totalpass_occurrence_uuid": occurrence_uuid,
       }).eq("id", clase_id).execute()
 
-    return { "ok": True, "event_id": data.get("id"), "occurrence_uuid": occurrence_uuid }
+    return {
+      "ok":              True,
+      "event_id":        data.get("eventId"),
+      "occurrence_uuid": occurrence_uuid,
+    }
 
   except HTTPException:
     raise
