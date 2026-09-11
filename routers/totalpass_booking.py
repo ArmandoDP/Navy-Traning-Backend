@@ -68,6 +68,18 @@ async def totalpass_booking_webhook(request: Request):
     cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
     cliente_id  = cliente_res.data["id"] if cliente_res.data else None
 
+    # Verificar si ya existe la reserva
+    if clase and cliente_id:
+        existente = supabase.table("reservas").select("id")\
+            .eq("cliente_id", cliente_id)\
+            .eq("clase_id", clase["id"])\
+            .neq("estatus", "Cancelada")\
+            .maybe_single().execute()
+        
+        if existente.data:
+            print("Reserva duplicada ignorada:", cliente_id, clase["id"])
+            return { "received": True, "duplicado": True }
+
     if not cliente_id:
       new_cli = supabase.table("clientes").insert({
         "nombre_completo": nombre,
