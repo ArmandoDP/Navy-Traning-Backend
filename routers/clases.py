@@ -2,6 +2,7 @@ from fastapi        import APIRouter, HTTPException
 from services.supabase import supabase
 from services.push     import enviar_push
 import httpx
+import asyncio
 import os
 
 router = APIRouter()
@@ -148,50 +149,48 @@ async def cancelar_clase(req: dict):
     if not clase_id:
         raise HTTPException(status_code=400, detail="clase_id requerido")
 
-    # 1. Obtener clase con sucursal
-    clase_res = supabase.table("clases")\
-        .select("id, nombre_clase, horario, duracion_minutos, sucursal_id, sucursales(nombre)")\
-        .eq("id", clase_id).single().execute()
+    # Correr Supabase en thread separado
+    def _cancelar():
+        clase_res = supabase.table("clases")\
+            .select("id, nombre_clase, horario, duracion_minutos, sucursal_id, sucursales(nombre)")\
+            .eq("id", clase_id).single().execute()
+        if not clase_res.data:
+            return None, []
+        
+        clase = clase_res.data
+        supabase.table("clases").update({ "estado": "Cancelada" }).eq("id", clase_id).execute()
+        
+        reservas_res = supabase.table("reservas")\
+            .select("id, cliente_id, clientes(nombre_completo, email, push_tokens(token))")\
+            .eq("clase_id", clase_id).neq("estatus", "Cancelada").execute()
+        
+        reservas = reservas_res.data or []
+        if reservas:
+            ids = [r["id"] for r in reservas]
+            supabase.table("reservas").update({
+                "estatus": "Cancelada",
+                "metadata": {"motivo": "clase_cancelada"}
+            }).in_("id", ids).execute()
+        
+        return clase, reservas
 
-    if not clase_res.data:
+    clase, reservas = await asyncio.to_thread(_cancelar)
+    
+    if not clase:
         raise HTTPException(status_code=404, detail="Clase no encontrada")
 
-    clase      = clase_res.data
-    sucursal   = clase.get("sucursales", {}).get("nombre", "Navy Training Center")
+    sucursal = clase.get("sucursales", {}).get("nombre", "Navy Training Center")
 
-    # 2. Cancelar la clase
-    supabase.table("clases").update({ "estado": "Cancelada" }).eq("id", clase_id).execute()
-
-    # 3. Obtener reservas activas de esa clase
-    reservas_res = supabase.table("reservas")\
-        .select("id, cliente_id, clientes(nombre_completo, email, push_tokens(token))")\
-        .eq("clase_id", clase_id)\
-        .neq("estatus", "Cancelada")\
-        .execute()
-
-    reservas = reservas_res.data or []
-
-    # 4. Cancelar todas las reservas con motivo "clase_cancelada"
-    if reservas:
-        ids = [r["id"] for r in reservas]
-        supabase.table("reservas").update({
-            "estatus": "Cancelada",
-            "metadata": {"motivo": "clase_cancelada"}
-        }).in_("id", ids).execute()
-
-    # 5. Push + correo a cada cliente
     for r in reservas:
         cliente = r.get("clientes", {})
         if not cliente:
             continue
+        nombre = cliente.get("nombre_completo", "")
+        email  = cliente.get("email", "")
+        tokens = [pt["token"] for pt in (cliente.get("push_tokens") or [])]
+        hora   = fmt_hora(clase["horario"])
+        fecha  = fmt_fecha(clase["horario"])
 
-        nombre  = cliente.get("nombre_completo", "")
-        email   = cliente.get("email", "")
-        tokens  = [pt["token"] for pt in (cliente.get("push_tokens") or [])]
-        hora    = fmt_hora(clase["horario"])
-        fecha   = fmt_fecha(clase["horario"])
-
-        # Push
         if tokens:
             await enviar_push(
                 tokens,
@@ -199,8 +198,6 @@ async def cancelar_clase(req: dict):
                 cuerpo=f"Tu clase del {fecha} a las {hora} en {sucursal} fue cancelada. Puedes reservar otra clase.",
                 data={ "tipo": "clase_cancelada", "clase_id": clase_id }
             )
-
-        # Correo
         if email:
             try:
                 await enviar_correo_cancelacion(email, nombre, clase, sucursal)
@@ -208,8 +205,8 @@ async def cancelar_clase(req: dict):
                 print(f"Error enviando correo cancelación a {email}:", e)
 
     return {
-        "ok":              True,
+        "ok": True,
         "clase_cancelada": clase_id,
         "reservas_canceladas": len(reservas),
-        "notificados":     len(reservas),
+        "notificados": len(reservas),
     }
