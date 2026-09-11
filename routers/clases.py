@@ -132,7 +132,7 @@ async def cancelar_clase(req: dict):
             headers=headers,
             params={
                 "id":     f"eq.{clase_id}",
-                "select": "id,nombre_clase,horario,duracion_minutos,sucursal_id,sucursales(nombre)",
+                "select": "id,nombre_clase,horario,duracion_minutos,sucursal_id,wellhub_slot_id,wellhub_class_id,totalpass_occurrence_uuid,sucursales(nombre,totalpass_place_api_key)",
             }
         )
         clases_data = r.json()
@@ -148,6 +148,52 @@ async def cancelar_clase(req: dict):
             params={"id": f"eq.{clase_id}"},
             json={"estado": "Cancelada"},
         )
+
+        # Cancelar slot en Wellhub
+        wellhub_slot_id  = clase.get("wellhub_slot_id")
+        wellhub_class_id = clase.get("wellhub_class_id")
+        sucursal_id      = clase.get("sucursal_id")
+
+        WELLHUB_GYM_IDS = {
+            "1b2032dc-f5da-40c6-8c4e-e227be14673b": "848637",  # Condesa Gym
+            "f8f798a8-d89b-4874-a53a-cdcb6325ad2a": "848638",  # Condesa Studio
+        }
+        WELLHUB_API_KEY = os.getenv("WELLHUB_API_KEY")
+
+        if wellhub_slot_id and wellhub_class_id and sucursal_id:
+            gym_id = WELLHUB_GYM_IDS.get(sucursal_id)
+            if gym_id:
+                try:
+                    wh_url = f"https://api.partners.gympass.com/booking/v1/gyms/{gym_id}/classes/{wellhub_class_id}/slots/{wellhub_slot_id}"
+                    await client.delete(wh_url, headers={
+                        "Authorization": f"Bearer {WELLHUB_API_KEY}",
+                        "Content-Type":  "application/json",
+                    })
+                except Exception as e:
+                    print(f"Error cancelando slot Wellhub: {e}")
+
+        # Cancelar en TotalPass
+        occurrence_uuid   = clase.get("totalpass_occurrence_uuid")
+        place_api_key_tp  = (clase.get("sucursales") or {}).get("totalpass_place_api_key")
+
+        if occurrence_uuid and place_api_key_tp:
+            try:
+                # Auth TotalPass
+                tp_auth = await client.post(
+                    "https://booking-api.totalpass.com/partner/auth",
+                    json={
+                        "partner_api_key": os.getenv("TOTALPASS_PARTNER_API_KEY"),
+                        "place_api_key":   place_api_key_tp,
+                    }
+                )
+                tp_token = tp_auth.json().get("token")
+                if tp_token:
+                    await client.delete(
+                        f"https://booking-api.totalpass.com/partner/events/{occurrence_uuid}",
+                        headers={"Authorization": f"Bearer {tp_token}", "accept": "application/json"},
+                    )
+            except Exception as e:
+                print(f"Error cancelando TotalPass: {e}")
 
         # 3. Obtener reservas activas
         r2 = await client.get(
