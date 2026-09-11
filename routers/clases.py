@@ -142,7 +142,7 @@ async def enviar_correo_cancelacion(email: str, nombre: str, clase: dict, sucurs
         )
 
 
-@router.post("/clases/cancelar")
+@router.post("/cancelar")
 async def cancelar_clase(req: dict):
     clase_id = req.get("clase_id")
     if not clase_id:
