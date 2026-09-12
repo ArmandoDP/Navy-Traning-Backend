@@ -254,3 +254,25 @@ async def publicar_clase_totalpass(req: dict):
     raise
   except Exception as e:
     raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/actualizar-cupos")
+async def actualizar_cupos_totalpass(req: dict):
+    occurrence_uuid = req.get("occurrence_uuid")
+    sucursal_id     = req.get("sucursal_id")
+    slots           = req.get("slots")  # cupos totales disponibles para TotalPass
+
+    if not occurrence_uuid or not sucursal_id:
+        raise HTTPException(status_code=400, detail="Faltan parámetros")
+
+    place_api_key = get_place_api_key(sucursal_id)
+    token         = await get_booking_token(place_api_key)
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.put(
+            f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
+            json={"slots": slots},
+        )
+        print(f"TotalPass actualizar cupos: {res.status_code} {res.text}")
+
+    return {"ok": True, "slots": slots}
