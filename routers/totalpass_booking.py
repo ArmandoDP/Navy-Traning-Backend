@@ -81,14 +81,17 @@ async def totalpass_booking_webhook(request: Request):
 
     # Anti-duplicado
     if cliente_id:
-      existente = supabase.table("reservas").select("id")\
-        .eq("cliente_id", cliente_id)\
-        .eq("clase_id", clase["id"])\
-        .neq("estatus", "Cancelada")\
-        .maybe_single().execute()
-      if existente.data:
-        print("Reserva duplicada ignorada:", cliente_id, clase["id"])
-        return { "received": True, "duplicado": True }
+      try:
+          existente = supabase.table("reservas").select("id")\
+              .eq("cliente_id", cliente_id)\
+              .eq("clase_id", clase["id"])\
+              .neq("estatus", "Cancelada")\
+              .maybe_single().execute()
+          if existente and existente.data:
+              print("Reserva duplicada ignorada:", cliente_id, clase["id"])
+              return { "received": True, "duplicado": True }
+      except Exception as e:
+          print("Error verificando duplicado:", e)
 
     print("6. Insertando totalpass_bookings...")
     supabase.table("totalpass_bookings").insert({
