@@ -58,42 +58,34 @@ async def totalpass_booking_webhook(request: Request):
 
     clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
-    print("clase_res:", clase_res)
-    print("clase_res.data:", clase_res.data if clase_res else "clase_res es None")
     clase = clase_res.data
 
     if not clase:
       print(f"Clase no encontrada para occurrence_uuid: {occurrence_uuid}")
       return { "received": True, "error": "Clase no encontrada" }
 
-    print("1. Buscando place_api_key...")
     if clase.get("sucursal_id"):
       place_api_key = get_place_api_key(clase["sucursal_id"])
     else:
       place_api_key = os.getenv("TOTALPASS_PLACE_API_KEY")
-    print("2. place_api_key:", place_api_key[:10] if place_api_key else "None")
 
-    print("3. Buscando cliente:", email)
     cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
-    print("4. cliente_res:", cliente_res)
     cliente_id  = cliente_res.data["id"] if cliente_res.data else None
-    print("5. cliente_id:", cliente_id)
 
     # Anti-duplicado
     if cliente_id:
       try:
-          existente = supabase.table("reservas").select("id")\
-              .eq("cliente_id", cliente_id)\
-              .eq("clase_id", clase["id"])\
-              .neq("estatus", "Cancelada")\
-              .maybe_single().execute()
-          if existente and existente.data:
-              print("Reserva duplicada ignorada:", cliente_id, clase["id"])
-              return { "received": True, "duplicado": True }
+        existente = supabase.table("reservas").select("id")\
+          .eq("cliente_id", cliente_id)\
+          .eq("clase_id", clase["id"])\
+          .neq("estatus", "Cancelada")\
+          .maybe_single().execute()
+        if existente and existente.data:
+          print("Reserva duplicada ignorada:", cliente_id, clase["id"])
+          return { "received": True, "duplicado": True }
       except Exception as e:
-          print("Error verificando duplicado:", e)
+        print("Error verificando duplicado:", e)
 
-    print("6. Insertando totalpass_bookings...")
     supabase.table("totalpass_bookings").insert({
       "slot_id":         slot_id,
       "email":           email,
@@ -104,34 +96,33 @@ async def totalpass_booking_webhook(request: Request):
       "estatus":         "Pendiente",
       "metadata":        body,
     }).execute()
-    print("7. Insert OK")
 
-    print("8. Obteniendo token...")
     token    = await get_booking_token(place_api_key)
-    print("9. Token OK")
     ocupados = clase.get("espacios_ocupados") or 0
     hay_cupo = ocupados < clase.get("capacidad_max", 999)
 
     if hay_cupo:
+      # Crear reserva primero
+      if cliente_id:
+        supabase.table("reservas").insert({
+          "clase_id":   clase["id"],
+          "cliente_id": cliente_id,
+          "estatus":    "Confirmada",
+          "origen":     "TotalPass",
+        }).execute()
+
+      supabase.table("clases").update({
+        "espacios_ocupados": ocupados + 1
+      }).eq("id", clase["id"]).execute()
+
+      # Luego confirmar en TotalPass
       try:
         await confirmar_slot(slot_id, token, "confirmed")
         supabase.table("totalpass_bookings").update({ "estatus": "Confirmado" })\
           .eq("slot_id", slot_id).execute()
-
-        if cliente_id:
-          supabase.table("reservas").insert({
-            "clase_id":   clase["id"],
-            "cliente_id": cliente_id,
-            "estatus":    "Confirmada",
-            "origen":     "TotalPass",
-          }).execute()
-
-        supabase.table("clases").update({
-          "espacios_ocupados": ocupados + 1
-        }).eq("id", clase["id"]).execute()
-
       except Exception as errConfirm:
         print("Error confirmando booking:", str(errConfirm))
+
     else:
       try:
         await confirmar_slot(slot_id, token, "denied", "class_overbooked")
