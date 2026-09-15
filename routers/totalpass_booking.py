@@ -58,6 +58,8 @@ async def totalpass_booking_webhook(request: Request):
 
     clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
+    print("clase_res:", clase_res)
+    print("clase_res.data:", clase_res.data if clase_res else "clase_res es None")
     clase = clase_res.data
 
     if not clase:
