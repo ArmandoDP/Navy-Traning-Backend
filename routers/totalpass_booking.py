@@ -66,13 +66,18 @@ async def totalpass_booking_webhook(request: Request):
       print(f"Clase no encontrada para occurrence_uuid: {occurrence_uuid}")
       return { "received": True, "error": "Clase no encontrada" }
 
+    print("1. Buscando place_api_key...")
     if clase.get("sucursal_id"):
       place_api_key = get_place_api_key(clase["sucursal_id"])
     else:
       place_api_key = os.getenv("TOTALPASS_PLACE_API_KEY")
+    print("2. place_api_key:", place_api_key[:10] if place_api_key else "None")
 
+    print("3. Buscando cliente:", email)
     cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
+    print("4. cliente_res:", cliente_res)
     cliente_id  = cliente_res.data["id"] if cliente_res.data else None
+    print("5. cliente_id:", cliente_id)
 
     # Anti-duplicado
     if cliente_id:
@@ -85,6 +90,7 @@ async def totalpass_booking_webhook(request: Request):
         print("Reserva duplicada ignorada:", cliente_id, clase["id"])
         return { "received": True, "duplicado": True }
 
+    print("6. Insertando totalpass_bookings...")
     supabase.table("totalpass_bookings").insert({
       "slot_id":         slot_id,
       "email":           email,
@@ -95,8 +101,11 @@ async def totalpass_booking_webhook(request: Request):
       "estatus":         "Pendiente",
       "metadata":        body,
     }).execute()
+    print("7. Insert OK")
 
+    print("8. Obteniendo token...")
     token    = await get_booking_token(place_api_key)
+    print("9. Token OK")
     ocupados = clase.get("espacios_ocupados") or 0
     hay_cupo = ocupados < clase.get("capacidad_max", 999)
 
