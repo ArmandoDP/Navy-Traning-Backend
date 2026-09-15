@@ -57,8 +57,13 @@ async def totalpass_booking_webhook(request: Request):
       return { "received": True, "error": "slot_id faltante" }
 
     clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
-      .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
+        .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
     clase = clase_res.data
+
+    # Agregar esto:
+    if not clase:
+        print(f"Clase no encontrada para occurrence_uuid: {occurrence_uuid}")
+        return { "received": True, "error": "Clase no encontrada" }
 
     if clase and clase.get("sucursal_id"):
       place_api_key = get_place_api_key(clase["sucursal_id"])
@@ -81,13 +86,7 @@ async def totalpass_booking_webhook(request: Request):
             return { "received": True, "duplicado": True }
 
     if not cliente_id:
-      new_cli = supabase.table("clientes").insert({
-        "nombre_completo": nombre,
-        "email":           email,
-        "estatus":         "Activo",
-        "plan":            "TotalPass",
-      }).select().single().execute()
-      cliente_id = new_cli.data["id"] if new_cli.data else None
+      cliente_id = None  # no crear cliente
 
     supabase.table("totalpass_bookings").insert({
       "slot_id":         slot_id,
