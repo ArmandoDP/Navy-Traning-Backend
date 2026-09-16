@@ -105,10 +105,12 @@ async def totalpass_booking_webhook(request: Request):
       # Crear reserva primero
       if cliente_id:
         supabase.table("reservas").insert({
-          "clase_id":   clase["id"],
-          "cliente_id": cliente_id,
-          "estatus":    "Confirmada",
-          "origen":     "TotalPass",
+            "clase_id":       clase["id"],
+            "cliente_id":     cliente_id,
+            "estatus":        "Confirmada",
+            "origen":         "TotalPass",
+            "nombre_externo": nombre if not cliente_id else None,
+            "email_externo":  email  if not cliente_id else None,
         }).execute()
 
       supabase.table("clases").update({
