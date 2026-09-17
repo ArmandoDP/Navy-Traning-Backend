@@ -276,3 +276,42 @@ async def actualizar_cupos_totalpass(req: dict):
         print(f"TotalPass actualizar cupos: {res.status_code} {res.text}")
 
     return {"ok": True, "slots": slots}
+
+
+@router.post("/actualizar-clase")
+async def actualizar_clase_totalpass(req: dict):
+    occurrence_uuid  = req.get("occurrence_uuid")
+    sucursal_id      = req.get("sucursal_id")
+    horario          = req.get("horario")
+    duracion_minutos = req.get("duracion_minutos")
+    capacidad_max    = req.get("capacidad_max")
+    nombre           = req.get("nombre")
+    coach            = req.get("coach", "Navy Coach")
+
+    if not occurrence_uuid or not sucursal_id:
+        raise HTTPException(status_code=400, detail="Faltan parámetros")
+
+    place_api_key = get_place_api_key(sucursal_id)
+    token         = await get_booking_token(place_api_key)
+
+    payload = {}
+    if nombre:           payload["title"]     = nombre
+    if coach:            payload["responsible"] = coach
+    if duracion_minutos: payload["duration"]  = duracion_minutos
+    if capacidad_max:    payload["slots"]     = capacidad_max
+    if horario:
+        from datetime import datetime, timedelta
+        dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
+        dt_cdmx = dt_utc - timedelta(hours=6)
+        payload["eventDate"] = dt_cdmx.strftime("%Y-%m-%d")
+        payload["startTime"] = dt_cdmx.strftime("%I:%M %p").lstrip("0")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.put(
+            f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
+            json=payload,
+        )
+        print(f"TotalPass actualizar clase: {res.status_code} {res.text}")
+
+    return {"ok": True}
