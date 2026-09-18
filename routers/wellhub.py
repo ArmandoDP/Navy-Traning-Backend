@@ -63,6 +63,10 @@ async def actualizar_slot_wellhub(req: dict):
     if capacidad_max:
         payload["total_capacity"] = capacidad_max
 
+
+    print("Wellhub PATCH payload:", payload)
+    print("Wellhub PATCH url:", f"{WELLHUB_BASE_URL}/booking/v1/gyms/{gym_id}/classes/{clase_id}/slots/{slot_id}")
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.patch(
             f"{WELLHUB_BASE_URL}/booking/v1/gyms/{gym_id}/classes/{clase_id}/slots/{slot_id}",
