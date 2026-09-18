@@ -178,7 +178,6 @@ async def cancelar_clase(req: dict):
 
         if occurrence_uuid and place_api_key_tp:
             try:
-                # Auth TotalPass
                 tp_auth = await client.post(
                     "https://booking-api.totalpass.com/partner/auth",
                     json={
@@ -188,10 +187,22 @@ async def cancelar_clase(req: dict):
                 )
                 tp_token = tp_auth.json().get("token")
                 if tp_token:
-                    await client.delete(
-                        f"https://booking-api.totalpass.com/partner/events/{occurrence_uuid}",
-                        headers={"Authorization": f"Bearer {tp_token}", "accept": "application/json"},
+                    tp_headers = {"Authorization": f"Bearer {tp_token}", "accept": "application/json"}
+                    # Obtener id numérico del evento
+                    get_res = await client.get(
+                        f"https://booking-api.totalpass.com/partner/event-occurrence/{occurrence_uuid}",
+                        headers=tp_headers,
                     )
+                    if get_res.ok:
+                        event_id = get_res.json().get("id")
+                        if event_id:
+                            await client.delete(
+                                f"https://booking-api.totalpass.com/partner/events/{event_id}",
+                                headers=tp_headers,
+                            )
+                            print(f"TotalPass evento {event_id} cancelado")
+                    else:
+                        print(f"TotalPass GET evento: {get_res.status_code} {get_res.text}")
             except Exception as e:
                 print(f"Error cancelando TotalPass: {e}")
 
