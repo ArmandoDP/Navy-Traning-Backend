@@ -71,6 +71,7 @@ async def actualizar_slot_wellhub(req: dict):
         "room":              room,
         "length_in_minutes": duracion_minutos,
         "total_capacity":    capacidad_max,
+        "total_booked":      0,  # ← agrega esto
         "product_id":        product_id,
         "instructors":       [],
         "rate":              0,
