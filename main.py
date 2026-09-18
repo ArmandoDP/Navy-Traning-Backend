@@ -32,7 +32,7 @@ app.include_router(totalpass_booking.router, prefix="/totalpass-booking")
 app.include_router(clientes.router,          prefix="/clientes")
 app.include_router(clases.router,            prefix="/clases")
 app.include_router(wellhub.router,           prefix="/wellhub")
-app.include_router(confirmar_reserva.router, prefix="/confirmar-reserva")
+app.include_router(confirmar_reserva.router)  # sin prefix
 
 # Scheduler
 scheduler = AsyncIOScheduler()

@@ -172,9 +172,9 @@ async def cancelar_clase(req: dict):
                 except Exception as e:
                     print(f"Error cancelando slot Wellhub: {e}")
 
-        # Cancelar en TotalPass
-        occurrence_uuid   = clase.get("totalpass_occurrence_uuid")
-        place_api_key_tp  = (clase.get("sucursales") or {}).get("totalpass_place_api_key")
+       # Cancelar en TotalPass
+        occurrence_uuid  = clase.get("totalpass_occurrence_uuid")
+        place_api_key_tp = (clase.get("sucursales") or {}).get("totalpass_place_api_key")
 
         if occurrence_uuid and place_api_key_tp:
             try:
@@ -187,25 +187,15 @@ async def cancelar_clase(req: dict):
                 )
                 tp_token = tp_auth.json().get("token")
                 if tp_token:
-                    tp_headers = {"Authorization": f"Bearer {tp_token}", "accept": "application/json"}
-                    # Obtener id numérico del evento
-                    get_res = await client.get(
+                    del_res = await client.delete(
                         f"https://booking-api.totalpass.com/partner/event-occurrence/{occurrence_uuid}",
-                        headers=tp_headers,
+                        headers={"Authorization": f"Bearer {tp_token}", "accept": "application/json"},
                     )
-                    if get_res.ok:
-                        event_id = get_res.json().get("id")
-                        if event_id:
-                            await client.delete(
-                                f"https://booking-api.totalpass.com/partner/events/{event_id}",
-                                headers=tp_headers,
-                            )
-                            print(f"TotalPass evento {event_id} cancelado")
-                    else:
-                        print(f"TotalPass GET evento: {get_res.status_code} {get_res.text}")
+                    print(f"TotalPass cancelar: {del_res.status_code} {del_res.text}")
             except Exception as e:
                 print(f"Error cancelando TotalPass: {e}")
 
+                
         # 3. Obtener reservas activas
         r2 = await client.get(
             f"{SUPABASE_URL}/rest/v1/reservas",
