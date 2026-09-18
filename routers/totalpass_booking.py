@@ -280,6 +280,7 @@ async def actualizar_cupos_totalpass(req: dict):
 
 @router.post("/actualizar-clase")
 async def actualizar_clase_totalpass(req: dict):
+    print("actualizar-clase payload:", req)
     occurrence_uuid  = req.get("occurrence_uuid")
     sucursal_id      = req.get("sucursal_id")
     horario          = req.get("horario")

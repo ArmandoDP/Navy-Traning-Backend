@@ -40,6 +40,7 @@ async def actualizar_cupos_wellhub(req: dict):
 
 @router.post("/actualizar-slot")
 async def actualizar_slot_wellhub(req: dict):
+    print("Wellhub actualizar-slot payload recibido:", req)
     slot_id          = req.get("slot_id")
     clase_id         = req.get("clase_id")
     sucursal_id      = req.get("sucursal_id")
