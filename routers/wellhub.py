@@ -1,13 +1,14 @@
 from fastapi import APIRouter, HTTPException
 import httpx
 import os
+from datetime import datetime, timedelta
 
 router = APIRouter()
 
 WELLHUB_BASE_URL = "https://api.partners.gympass.com"
 WELLHUB_GYM_IDS  = {
-    "1b2032dc-f5da-40c6-8c4e-e227be14673b": "848637",  # Condesa Gym
-    "f8f798a8-d89b-4874-a53a-cdcb6325ad2a": "848638",  # Condesa Studio
+    "1b2032dc-f5da-40c6-8c4e-e227be14673b": {"gym_id": "848637", "product_id": 953550},
+    "f8f798a8-d89b-4874-a53a-cdcb6325ad2a": {"gym_id": "848638", "product_id": 953551},
 }
 
 def wellhub_headers():
@@ -23,9 +24,10 @@ async def actualizar_cupos_wellhub(req: dict):
     total_booked = req.get("total_booked", 0)
     sucursal_id  = req.get("sucursal_id")
 
-    gym_id = WELLHUB_GYM_IDS.get(sucursal_id)
-    if not gym_id:
+    config = WELLHUB_GYM_IDS.get(sucursal_id)
+    if not config:
         raise HTTPException(status_code=400, detail="Sucursal no configurada")
+    gym_id = config["gym_id"]
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.patch(
@@ -45,30 +47,40 @@ async def actualizar_slot_wellhub(req: dict):
     clase_id         = req.get("clase_id")
     sucursal_id      = req.get("sucursal_id")
     horario          = req.get("horario")
-    duracion_minutos = req.get("duracion_minutos")
-    capacidad_max    = req.get("capacidad_max")
+    duracion_minutos = req.get("duracion_minutos", 60)
+    capacidad_max    = req.get("capacidad_max", 20)
+    room             = req.get("room", "Sala Principal")
 
-    gym_id = WELLHUB_GYM_IDS.get(sucursal_id)
-    if not gym_id:
+    config = WELLHUB_GYM_IDS.get(sucursal_id)
+    if not config:
         raise HTTPException(status_code=400, detail="Sucursal no configurada")
+    gym_id     = config["gym_id"]
+    product_id = config["product_id"]
 
-    payload = {}
-    if horario:
-        # Mandar UTC con Z — igual que al crear
-        from datetime import datetime
-        dt = datetime.fromisoformat(horario.replace("Z", "+00:00"))
-        payload["occur_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    if duracion_minutos:
-        payload["length_in_minutes"] = duracion_minutos
-    if capacidad_max:
-        payload["total_capacity"] = capacidad_max
+    if not horario:
+        raise HTTPException(status_code=400, detail="horario requerido")
 
+    # Convertir UTC → CDMX (UTC-6) y mandar con offset -06:00
+    dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
+    dt_cdmx = dt_utc - timedelta(hours=6)
+    occur_date = dt_cdmx.strftime("%Y-%m-%dT%H:%M:%S") + "-06:00"
 
-    print("Wellhub PATCH payload:", payload)
-    print("Wellhub PATCH url:", f"{WELLHUB_BASE_URL}/booking/v1/gyms/{gym_id}/classes/{clase_id}/slots/{slot_id}")
+    payload = {
+        "occur_date":        occur_date,
+        "status":            1,
+        "room":              room,
+        "length_in_minutes": duracion_minutos,
+        "total_capacity":    capacidad_max,
+        "product_id":        product_id,
+        "instructors":       [],
+        "rate":              0,
+    }
+
+    print("Wellhub PUT payload:", payload)
+    print("Wellhub PUT url:", f"{WELLHUB_BASE_URL}/booking/v1/gyms/{gym_id}/classes/{clase_id}/slots/{slot_id}")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.patch(
+        res = await client.put(
             f"{WELLHUB_BASE_URL}/booking/v1/gyms/{gym_id}/classes/{clase_id}/slots/{slot_id}",
             headers=wellhub_headers(),
             json=payload,
