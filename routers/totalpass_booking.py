@@ -56,6 +56,13 @@ async def totalpass_booking_webhook(request: Request):
     if not slot_id:
       return { "received": True, "error": "slot_id faltante" }
 
+    # Anti-duplicado por slot_id — antes de todo
+    existente_slot = supabase.table("totalpass_bookings").select("id")\
+      .eq("slot_id", slot_id).maybe_single().execute()
+    if existente_slot and existente_slot.data:
+      print(f"Slot {slot_id} ya procesado — ignorando webhook duplicado")
+      return { "received": True, "duplicado": True }
+
     clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
     clase = clase_res.data
@@ -72,7 +79,7 @@ async def totalpass_booking_webhook(request: Request):
     cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
     cliente_id  = cliente_res.data["id"] if cliente_res.data else None
 
-    # Anti-duplicado
+    # Anti-duplicado por cliente + clase
     if cliente_id:
       try:
         existente = supabase.table("reservas").select("id")\
@@ -102,22 +109,21 @@ async def totalpass_booking_webhook(request: Request):
     hay_cupo = ocupados < clase.get("capacidad_max", 999)
 
     if hay_cupo:
-      # Crear reserva primero
-      if cliente_id:
-        supabase.table("reservas").insert({
-            "clase_id":       clase["id"],
-            "cliente_id":     cliente_id,
-            "estatus":        "Confirmada",
-            "origen":         "TotalPass",
-            "nombre_externo": nombre if not cliente_id else None,
-            "email_externo":  email  if not cliente_id else None,
-        }).execute()
+      # Crear reserva
+      supabase.table("reservas").insert({
+        "clase_id":       clase["id"],
+        "cliente_id":     cliente_id,
+        "estatus":        "Confirmada",
+        "origen":         "TotalPass",
+        "nombre_externo": nombre if not cliente_id else None,
+        "email_externo":  email  if not cliente_id else None,
+      }).execute()
 
       supabase.table("clases").update({
         "espacios_ocupados": ocupados + 1
       }).eq("id", clase["id"]).execute()
 
-      # Luego confirmar en TotalPass
+      # Confirmar en TotalPass
       try:
         await confirmar_slot(slot_id, token, "confirmed")
         supabase.table("totalpass_bookings").update({ "estatus": "Confirmado" })\
