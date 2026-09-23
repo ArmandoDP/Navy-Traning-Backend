@@ -220,6 +220,11 @@ async def publicar_clase_totalpass(req: dict):
     event_date = dt_cdmx.strftime("%Y-%m-%d")   # "2026-09-10"
     start_time = dt_cdmx.strftime("%I:%M %p")   # "07:55 AM"
 
+    # Obtener reservas activas
+    reservas_res = supabase.table("reservas").select("id", count="exact")\
+      .eq("clase_id", clase_id).neq("estatus", "Cancelada").execute()
+    reservas_activas = reservas_res.count or 0
+
     print(f"Publicando en TotalPass: {nombre} | {event_date} {start_time}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -234,7 +239,7 @@ async def publicar_clase_totalpass(req: dict):
           "title":       nombre,
           "responsible": coach,
           "duration":    duracion,
-          "slots":       capacidad,
+          "slots": max(0, capacidad - reservas_activas),
           "planId":      plan_id,
           "eventDate":   event_date,
           "startTime":   start_time,
