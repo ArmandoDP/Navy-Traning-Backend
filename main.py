@@ -43,6 +43,7 @@ async def startup():
   scheduler.add_job(check_membresias_por_vencer, 'cron', hour=14, minute=0)
   scheduler.add_job(check_no_shows,              'cron', minute=30)
   scheduler.add_job(check_clases_en_curso,       'cron', minute='*/15')
+  scheduler.add_job(lambda: ..., 'cron', hour='*', minute=0)  # cada hora
   scheduler.start()
 
 @app.on_event("shutdown")

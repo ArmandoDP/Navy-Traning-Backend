@@ -41,3 +41,21 @@ async def run_renovar_membresias(x_cron_secret: str = Header(None)):
   from services.push import check_renovaciones_recurrentes
   await check_renovaciones_recurrentes()
   return { "ok": True, "job": "renovar_membresias" }
+
+@router.post("/sincronizar-planes")
+async def run_sincronizar_planes(x_cron_secret: str = Header(None)):
+  if x_cron_secret != CRON_SECRET:
+    raise HTTPException(status_code=401, detail="Unauthorized")
+  from services.supabase import supabase
+  
+  # Obtener clientes con membresía activa
+  membs = supabase.table("membresias").select("cliente_id, paquete_id, paquetes(nombre)")\
+    .eq("estatus", "Activa").execute()
+  
+  for m in (membs.data or []):
+    supabase.table("clientes").update({
+      "plan":       m["paquetes"]["nombre"] if m.get("paquetes") else "",
+      "paquete_id": m["paquete_id"],
+    }).eq("id", m["cliente_id"]).execute()
+
+  return { "ok": True, "job": "sincronizar_planes", "actualizados": len(membs.data or []) }
