@@ -50,7 +50,7 @@ async def totalpass_booking_webhook(request: Request):
 
     slot_id         = slot.get("id")
     email           = user.get("email")
-    nombre          = user.get("name")
+    nombre          = user.get("name") or ""
     occurrence_uuid = event.get("id")
 
     if not slot_id:
@@ -76,8 +76,25 @@ async def totalpass_booking_webhook(request: Request):
     else:
       place_api_key = os.getenv("TOTALPASS_PLACE_API_KEY")
 
+    # Buscar cliente existente
     cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
     cliente_id  = cliente_res.data["id"] if cliente_res.data else None
+
+    # Crear cliente si no existe
+    if not cliente_id and email:
+      try:
+        nombre_completo = nombre.strip() if nombre.strip() else email.split("@")[0]
+        nuevo = supabase.table("clientes").insert({
+          "nombre_completo": nombre_completo,
+          "email":           email,
+          "estatus":         "Activo",
+          "plan":            "TotalPass",
+          "origen":          "TotalPass",
+        }).execute()
+        cliente_id = nuevo.data[0]["id"] if nuevo.data else None
+        print(f"Cliente TotalPass creado: {email}")
+      except Exception as e:
+        print(f"Error creando cliente TotalPass: {e}")
 
     # Anti-duplicado por cliente + clase
     if cliente_id:
@@ -109,18 +126,16 @@ async def totalpass_booking_webhook(request: Request):
     hay_cupo = ocupados < clase.get("capacidad_max", 999)
 
     if hay_cupo:
-      # Insert protegido — si falla por duplicado no incrementa cupos
       try:
         supabase.table("reservas").insert({
           "clase_id":       clase["id"],
           "cliente_id":     cliente_id,
           "estatus":        "Confirmada",
           "origen":         "TotalPass",
-          "nombre_externo": nombre if not cliente_id else None,
-          "email_externo":  email  if not cliente_id else None,
+          "nombre_externo": None,
+          "email_externo":  None,
         }).execute()
 
-        # Solo incrementar si el insert fue exitoso
         supabase.table("clases").update({
           "espacios_ocupados": ocupados + 1
         }).eq("id", clase["id"]).execute()
@@ -128,7 +143,6 @@ async def totalpass_booking_webhook(request: Request):
       except Exception as e:
         print(f"Reserva duplicada o error — no se incrementan cupos: {e}")
 
-      # Confirmar en TotalPass
       try:
         await confirmar_slot(slot_id, token, "confirmed")
         supabase.table("totalpass_bookings").update({ "estatus": "Confirmado" })\
