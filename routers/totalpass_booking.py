@@ -90,6 +90,7 @@ async def totalpass_booking_webhook(request: Request):
           "estatus":         "Activo",
           "plan":            "TotalPass",
           "origen":          "TotalPass",
+          "sucursal_id":     clase.get("sucursal_id"),
         }).execute()
         cliente_id = nuevo.data[0]["id"] if nuevo.data else None
         print(f"Cliente TotalPass creado: {email}")
@@ -117,6 +118,7 @@ async def totalpass_booking_webhook(request: Request):
       "cliente_id":      cliente_id,
       "occurrence_uuid": str(occurrence_uuid),
       "clase_id":        clase["id"],
+      "sucursal_id":     clase.get("sucursal_id"),
       "estatus":         "Pendiente",
       "metadata":        body,
     }).execute()
@@ -132,6 +134,7 @@ async def totalpass_booking_webhook(request: Request):
           "cliente_id":     cliente_id,
           "estatus":        "Confirmada",
           "origen":         "TotalPass",
+          "sucursal_id":    clase.get("sucursal_id"),
           "nombre_externo": None,
           "email_externo":  None,
         }).execute()
