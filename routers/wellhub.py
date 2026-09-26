@@ -50,6 +50,7 @@ async def actualizar_slot_wellhub(req: dict):
     duracion_minutos = req.get("duracion_minutos", 60)
     capacidad_max    = req.get("capacidad_max", 20)
     room             = req.get("room", "Sala Principal")
+    coach            = req.get("coach")
 
     config = WELLHUB_GYM_IDS.get(sucursal_id)
     if not config:
@@ -73,7 +74,7 @@ async def actualizar_slot_wellhub(req: dict):
         "total_capacity":    capacidad_max,
         "total_booked":      0,  # ← agrega esto
         "product_id":        product_id,
-        "instructors":       [],
+        "instructors":       [{"name": coach, "substitute": False}] if coach else [],
         "rate":              0,
     }
 
