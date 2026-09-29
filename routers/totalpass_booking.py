@@ -35,8 +35,14 @@ async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "re
       headers={ "Authorization": f"Bearer {token}" },
       json={ "state": state, "reason": reason }
     )
-    res.raise_for_status()
-    return res.json()
+    print(f"confirmar_slot status: {res.status_code} {res.text[:200]}")
+    if not res.is_success:
+      print(f"Error confirmando slot: {res.status_code} {res.text}")
+      return {}
+    try:
+      return res.json()
+    except:
+      return {}
 
 @router.post("/booking/webhook")
 async def totalpass_booking_webhook(request: Request):
@@ -134,7 +140,6 @@ async def totalpass_booking_webhook(request: Request):
           "cliente_id":     cliente_id,
           "estatus":        "Confirmada",
           "origen":         "TotalPass",
-          "sucursal_id":    clase.get("sucursal_id"),
           "nombre_externo": None,
           "email_externo":  None,
         }).execute()
