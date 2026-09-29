@@ -19,6 +19,7 @@ async def sincronizar_planes():
     supabase.table("clientes").update({
       "plan":       m["paquetes"]["nombre"] if m.get("paquetes") else "",
       "paquete_id": m["paquete_id"],
+      "fecha_venc_plan": m["fecha_fin"],
     }).eq("id", m["cliente_id"]).execute()
   
   print(f"✅ {len(membs.data or [])} planes sincronizados")
