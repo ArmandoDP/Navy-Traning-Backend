@@ -35,10 +35,7 @@ async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "re
       headers={ "Authorization": f"Bearer {token}" },
       json={ "state": state, "reason": reason }
     )
-    print(f"confirmar_slot status: {res.status_code} {res.text[:200]}")
-    if not res.is_success:
-      print(f"Error confirmando slot: {res.status_code} {res.text}")
-      return {}
+    print(f"confirmar_slot: {res.status_code} {res.text[:100]}")
     try:
       return res.json()
     except:
