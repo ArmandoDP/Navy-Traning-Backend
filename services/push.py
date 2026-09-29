@@ -490,7 +490,18 @@ async def check_renovaciones_recurrentes():
     cliente_id = cliente.get("id")
 
     supabase.table("membresias").update({ "estatus": "Inactiva" }).eq("id", m["id"]).execute()
-    supabase.table("clientes").update({ "estatus": "Inactivo" }).eq("id", cliente_id).execute()
+    
+    # Verificar si tiene otra membresía activa antes de marcar inactivo
+    otras_membresias = supabase.table("membresias").select("id")\
+      .eq("cliente_id", cliente_id)\
+      .eq("estatus", "Activa")\
+      .neq("id", m["id"])\
+      .execute()
+
+    if not otras_membresias.data:
+      supabase.table("clientes").update({ "estatus": "Inactivo" }).eq("id", cliente_id).execute()
+    else:
+      print(f"Cliente {email} tiene otra membresía activa — no se marca inactivo")
 
     await enviar_push(tokens,
       titulo="❌ Tu membresía ha vencido",
