@@ -475,14 +475,19 @@ async def check_renovaciones_recurrentes():
         data={"tipo": "membresia_vence", "membresia_id": m["id"]})
       await enviar_correo(email, nombre, subj, msg_correo)
 
-  # Día del vencimiento — cancelar membresías vencidas
+  # No vencer por fecha los paquetes tipo 'clases'
   membresias_vencidas = supabase.table("membresias")\
-    .select("*, clientes(id, nombre_completo, email, push_tokens(token))")\
+    .select("*, clientes(id, nombre_completo, email, push_tokens(token)), paquetes(tipo)")\
     .eq("estatus", "Activa")\
     .lt("fecha_fin", hoy.isoformat())\
     .execute()
 
   for m in (membresias_vencidas.data or []):
+    # Saltar paquetes de tipo 'clases'
+    if m.get("paquetes", {}).get("tipo") == "clases":
+      print(f"Paquete tipo clases — no se vence por fecha: {m['id']}")
+      continue
+    
     cliente  = m.get("clientes", {})
     nombre   = (cliente.get("nombre_completo") or "").split()[0]
     email    = cliente.get("email")
