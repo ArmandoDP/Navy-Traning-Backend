@@ -61,14 +61,14 @@ async def totalpass_booking_webhook(request: Request):
 
     # Anti-duplicado por slot_id — antes de todo
     existente_slot = supabase.table("totalpass_bookings").select("id")\
-      .eq("slot_id", slot_id).maybe_single().execute()
-    if existente_slot and existente_slot.data:
+      .eq("slot_id", slot_id).limit(1).execute()
+    if existente_slot.data and len(existente_slot.data) > 0:
       print(f"Slot {slot_id} ya procesado — ignorando webhook duplicado")
       return { "received": True, "duplicado": True }
 
     clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
-      .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).maybe_single().execute()
-    clase = clase_res.data
+      .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).limit(1).execute()
+    clase = clase_res.data[0] if clase_res.data else None
 
     if not clase:
       print(f"Clase no encontrada para occurrence_uuid: {occurrence_uuid}")
@@ -80,8 +80,8 @@ async def totalpass_booking_webhook(request: Request):
       place_api_key = os.getenv("TOTALPASS_PLACE_API_KEY")
 
     # Buscar cliente existente
-    cliente_res = supabase.table("clientes").select("id").eq("email", email).maybe_single().execute()
-    cliente_id  = cliente_res.data["id"] if cliente_res.data else None
+    cliente_res = supabase.table("clientes").select("id").eq("email", email).limit(1).execute()
+    cliente_id = cliente_res.data[0]["id"] if cliente_res.data else None
 
     # Crear cliente si no existe
     if not cliente_id and email:
@@ -107,8 +107,8 @@ async def totalpass_booking_webhook(request: Request):
           .eq("cliente_id", cliente_id)\
           .eq("clase_id", clase["id"])\
           .neq("estatus", "Cancelada")\
-          .maybe_single().execute()
-        if existente and existente.data:
+          .limit(1).execute()
+        if existente.data and len(existente.data) > 0:
           print("Reserva duplicada ignorada:", cliente_id, clase["id"])
           return { "received": True, "duplicado": True }
       except Exception as e:
