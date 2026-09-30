@@ -8,6 +8,11 @@ router = APIRouter()
 PARTNER_API_KEY  = os.getenv("TOTALPASS_PARTNER_API_KEY")
 BOOKING_BASE_URL = "https://booking-api.totalpass.com"
 
+WELLHUB_GYM_IDS = {
+  "1b2032dc-f5da-40c6-8c4e-e227be14673b": {"gym_id": "848637"},  # Condesa Gym
+  "f8f798a8-d89b-4874-a53a-cdcb6325ad2a": {"gym_id": "848638"},  # Condesa Studio
+}
+
 def get_place_api_key(sucursal_id: str) -> str:
   res = supabase.table("sucursales").select("totalpass_place_api_key").eq("id", sucursal_id).single().execute()
   if not res.data or not res.data.get("totalpass_place_api_key"):
@@ -66,7 +71,7 @@ async def totalpass_booking_webhook(request: Request):
       print(f"Slot {slot_id} ya procesado — ignorando webhook duplicado")
       return { "received": True, "duplicado": True }
 
-    clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id")\
+    clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id, wellhub_slot_id, wellhub_class_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).limit(1).execute()
     clase = clase_res.data[0] if clase_res.data else None
 
@@ -144,6 +149,19 @@ async def totalpass_booking_webhook(request: Request):
         supabase.table("clases").update({
           "espacios_ocupados": ocupados + 1
         }).eq("id", clase["id"]).execute()
+
+        # Actualizar cupos en Wellhub
+        if clase.get("wellhub_slot_id") and clase.get("wellhub_class_id"):
+          try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+              await client.patch(
+                f"https://api.partners.gympass.com/booking/v1/gyms/{WELLHUB_GYM_IDS.get(clase['sucursal_id'], {}).get('gym_id')}/classes/{clase['wellhub_class_id']}/slots/{clase['wellhub_slot_id']}",
+                headers={"Authorization": f"Bearer {os.getenv('WELLHUB_API_KEY')}", "Content-Type": "application/json"},
+                json={"total_booked": ocupados + 1}
+              )
+              print(f"Wellhub cupos actualizados: {ocupados + 1}")
+          except Exception as e:
+            print(f"Error actualizando Wellhub desde TotalPass: {e}")
 
       except Exception as e:
         print(f"Reserva duplicada o error — no se incrementan cupos: {e}")
