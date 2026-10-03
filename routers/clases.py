@@ -245,3 +245,41 @@ async def cancelar_clase(req: dict):
         "reservas_canceladas": len(reservas),
         "notificados":       len(reservas),
     }
+
+
+@router.post("/eliminar-totalpass")
+async def eliminar_clase_totalpass(req: dict):
+    occurrence_uuid = req.get("occurrence_uuid")
+    sucursal_id     = req.get("sucursal_id")
+
+    if not occurrence_uuid or not sucursal_id:
+        raise HTTPException(status_code=400, detail="Faltan parámetros")
+
+    from services.supabase import supabase
+    sucursal_res = supabase.table("sucursales")\
+        .select("totalpass_place_api_key")\
+        .eq("id", sucursal_id).single().execute()
+    
+    place_api_key = sucursal_res.data.get("totalpass_place_api_key") if sucursal_res.data else None
+    if not place_api_key:
+        raise HTTPException(status_code=404, detail="No hay TotalPass key para esta sucursal")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        auth = await client.post(
+            "https://booking-api.totalpass.com/partner/auth",
+            json={
+                "partner_api_key": os.getenv("TOTALPASS_PARTNER_API_KEY"),
+                "place_api_key":   place_api_key,
+            }
+        )
+        token = auth.json().get("token")
+        if not token:
+            raise HTTPException(status_code=500, detail="Error obteniendo token TotalPass")
+
+        res = await client.delete(
+            f"https://booking-api.totalpass.com/partner/event-occurrence/{occurrence_uuid}",
+            headers={"Authorization": f"Bearer {token}", "accept": "application/json"},
+        )
+        print(f"TotalPass eliminar: {res.status_code} {res.text}")
+
+    return {"ok": True, "status": res.status_code}

@@ -90,3 +90,24 @@ async def actualizar_slot_wellhub(req: dict):
         print(f"Wellhub actualizar slot: {res.status_code} {res.text}")
 
     return {"ok": True}
+
+
+@router.post("/eliminar-slot")
+async def eliminar_slot_wellhub(req: dict):
+    slot_id     = req.get("slot_id")
+    clase_id    = req.get("clase_id")
+    sucursal_id = req.get("sucursal_id")
+
+    config = WELLHUB_GYM_IDS.get(sucursal_id)
+    if not config:
+        raise HTTPException(status_code=400, detail="Sucursal no configurada")
+    gym_id = config["gym_id"]
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.delete(
+            f"{WELLHUB_BASE_URL}/booking/v1/gyms/{gym_id}/classes/{clase_id}/slots/{slot_id}",
+            headers=wellhub_headers(),
+        )
+        print(f"Wellhub eliminar slot: {res.status_code} {res.text}")
+
+    return {"ok": True, "status": res.status_code}
