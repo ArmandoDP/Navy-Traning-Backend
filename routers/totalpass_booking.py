@@ -287,10 +287,12 @@ async def publicar_clase_totalpass(req: dict):
       )
       print("TotalPass publicar clase:", res.status_code, res.text)
       res.raise_for_status()
+      print("TotalPass publicar clase:", res.status_code, res.text)
       data = res.json()
 
     # Leer occurrenceUuid del response
     occurrence_uuid = data.get("eventOccurrenceUuid")
+    print(f"UUID guardado: {occurrence_uuid}")
 
     if clase_id and occurrence_uuid:
       supabase.table("clases").update({
