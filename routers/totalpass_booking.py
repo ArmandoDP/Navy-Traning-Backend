@@ -324,7 +324,7 @@ async def actualizar_cupos_totalpass(req: dict):
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.put(
-            f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}",
+            f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}/slot",  # ← agrega /slot
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
             json={"slots": slots},
         )
