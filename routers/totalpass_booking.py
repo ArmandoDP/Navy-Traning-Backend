@@ -1,5 +1,6 @@
-from fastapi        import APIRouter, Request, HTTPException
-from services.supabase import supabase
+from fastapi               import APIRouter, Request, HTTPException
+from services.supabase     import supabase
+from routers.sincronizacion import sincronizar_cupos
 import httpx
 import os
 
@@ -8,16 +9,13 @@ router = APIRouter()
 PARTNER_API_KEY  = os.getenv("TOTALPASS_PARTNER_API_KEY")
 BOOKING_BASE_URL = "https://booking-api.totalpass.com"
 
-WELLHUB_GYM_IDS = {
-  "1b2032dc-f5da-40c6-8c4e-e227be14673b": {"gym_id": "848637"},  # Condesa Gym
-  "f8f798a8-d89b-4874-a53a-cdcb6325ad2a": {"gym_id": "848638"},  # Condesa Studio
-}
 
 def get_place_api_key(sucursal_id: str) -> str:
   res = supabase.table("sucursales").select("totalpass_place_api_key").eq("id", sucursal_id).single().execute()
   if not res.data or not res.data.get("totalpass_place_api_key"):
     raise HTTPException(status_code=404, detail=f"No hay TotalPass place_api_key para sucursal {sucursal_id}")
   return res.data["totalpass_place_api_key"]
+
 
 async def get_booking_token(place_api_key: str) -> str:
   async with httpx.AsyncClient() as client:
@@ -29,9 +27,9 @@ async def get_booking_token(place_api_key: str) -> str:
       }
     )
     print("TotalPass auth status:", res.status_code)
-    print("TotalPass auth body:", res.text)
     res.raise_for_status()
     return res.json()["token"]
+
 
 async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "reason_not_provided"):
   async with httpx.AsyncClient() as client:
@@ -43,8 +41,9 @@ async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "re
     print(f"confirmar_slot: {res.status_code} {res.text[:100]}")
     try:
       return res.json()
-    except:
+    except Exception:
       return {}
+
 
 @router.post("/booking/webhook")
 async def totalpass_booking_webhook(request: Request):
@@ -64,14 +63,14 @@ async def totalpass_booking_webhook(request: Request):
     if not slot_id:
       return { "received": True, "error": "slot_id faltante" }
 
-    # Anti-duplicado por slot_id — antes de todo
+    # Anti-duplicado por slot_id
     existente_slot = supabase.table("totalpass_bookings").select("id")\
       .eq("slot_id", slot_id).limit(1).execute()
-    if existente_slot.data and len(existente_slot.data) > 0:
+    if existente_slot.data:
       print(f"Slot {slot_id} ya procesado — ignorando webhook duplicado")
       return { "received": True, "duplicado": True }
 
-    clase_res = supabase.table("clases").select("id, capacidad_max, espacios_ocupados, sucursal_id, wellhub_slot_id, wellhub_class_id")\
+    clase_res = supabase.table("clases").select("id, capacidad_max, sucursal_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).limit(1).execute()
     clase = clase_res.data[0] if clase_res.data else None
 
@@ -79,16 +78,13 @@ async def totalpass_booking_webhook(request: Request):
       print(f"Clase no encontrada para occurrence_uuid: {occurrence_uuid}")
       return { "received": True, "error": "Clase no encontrada" }
 
-    if clase.get("sucursal_id"):
-      place_api_key = get_place_api_key(clase["sucursal_id"])
-    else:
-      place_api_key = os.getenv("TOTALPASS_PLACE_API_KEY")
+    place_api_key = get_place_api_key(clase["sucursal_id"]) if clase.get("sucursal_id") \
+      else os.getenv("TOTALPASS_PLACE_API_KEY")
 
-    # Buscar cliente existente
+    # Buscar / crear cliente
     cliente_res = supabase.table("clientes").select("id").eq("email", email).limit(1).execute()
-    cliente_id = cliente_res.data[0]["id"] if cliente_res.data else None
+    cliente_id  = cliente_res.data[0]["id"] if cliente_res.data else None
 
-    # Crear cliente si no existe
     if not cliente_id and email:
       try:
         nombre_completo = nombre.strip() if nombre.strip() else email.split("@")[0]
@@ -107,17 +103,14 @@ async def totalpass_booking_webhook(request: Request):
 
     # Anti-duplicado por cliente + clase
     if cliente_id:
-      try:
-        existente = supabase.table("reservas").select("id")\
-          .eq("cliente_id", cliente_id)\
-          .eq("clase_id", clase["id"])\
-          .neq("estatus", "Cancelada")\
-          .limit(1).execute()
-        if existente.data and len(existente.data) > 0:
-          print("Reserva duplicada ignorada:", cliente_id, clase["id"])
-          return { "received": True, "duplicado": True }
-      except Exception as e:
-        print("Error verificando duplicado:", e)
+      existente = supabase.table("reservas").select("id")\
+        .eq("cliente_id", cliente_id)\
+        .eq("clase_id", clase["id"])\
+        .neq("estatus", "Cancelada")\
+        .limit(1).execute()
+      if existente.data:
+        print("Reserva duplicada ignorada:", cliente_id, clase["id"])
+        return { "received": True, "duplicado": True }
 
     supabase.table("totalpass_bookings").insert({
       "slot_id":         slot_id,
@@ -131,9 +124,13 @@ async def totalpass_booking_webhook(request: Request):
       "metadata":        body,
     }).execute()
 
-    token    = await get_booking_token(place_api_key)
-    ocupados = clase.get("espacios_ocupados") or 0
-    hay_cupo = ocupados < clase.get("capacidad_max", 999)
+    token = await get_booking_token(place_api_key)
+
+    # Cupo real = reservas activas en la BD (no el contador guardado)
+    activas_res = supabase.table("reservas").select("id", count="exact")\
+      .eq("clase_id", clase["id"]).neq("estatus", "Cancelada").execute()
+    activas  = activas_res.count or 0
+    hay_cupo = activas < (clase.get("capacidad_max") or 999)
 
     if hay_cupo:
       try:
@@ -145,26 +142,11 @@ async def totalpass_booking_webhook(request: Request):
           "nombre_externo": None,
           "email_externo":  None,
         }).execute()
-
-        supabase.table("clases").update({
-          "espacios_ocupados": ocupados + 1
-        }).eq("id", clase["id"]).execute()
-
-        # Actualizar cupos en Wellhub
-        if clase.get("wellhub_slot_id") and clase.get("wellhub_class_id"):
-          try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-              await client.patch(
-                f"https://api.partners.gympass.com/booking/v1/gyms/{WELLHUB_GYM_IDS.get(clase['sucursal_id'], {}).get('gym_id')}/classes/{clase['wellhub_class_id']}/slots/{clase['wellhub_slot_id']}",
-                headers={"Authorization": f"Bearer {os.getenv('WELLHUB_API_KEY')}", "Content-Type": "application/json"},
-                json={"total_booked": ocupados + 1}
-              )
-              print(f"Wellhub cupos actualizados: {ocupados + 1}")
-          except Exception as e:
-            print(f"Error actualizando Wellhub desde TotalPass: {e}")
-
       except Exception as e:
-        print(f"Reserva duplicada o error — no se incrementan cupos: {e}")
+        print(f"Error insertando reserva TotalPass: {e}")
+
+      # Supabase + Wellhub + TotalPass con el conteo real
+      await sincronizar_cupos(clase["id"])
 
       try:
         await confirmar_slot(slot_id, token, "confirmed")
@@ -186,6 +168,7 @@ async def totalpass_booking_webhook(request: Request):
   except Exception as e:
     print("Error TotalPass Booking webhook:", str(e))
     return { "received": True, "error": str(e) }
+
 
 @router.post("/booking/registrar-webhook")
 async def registrar_booking_webhook(sucursal_id: str = None):
@@ -233,7 +216,6 @@ async def publicar_clase_totalpass(req: dict):
     capacidad   = req.get("capacidad_max", 10)
     coach       = req.get("coach", "Navy Coach")
 
-    # Obtener keys y plan_id de la sucursal
     sucursal_res = supabase.table("sucursales")\
       .select("totalpass_place_api_key, totalpass_plan_id")\
       .eq("id", sucursal_id).single().execute()
@@ -246,27 +228,25 @@ async def publicar_clase_totalpass(req: dict):
     if not plan_id:
       raise HTTPException(status_code=400, detail="No hay planId de TotalPass para esta sucursal")
 
-    place_api_key = sucursal["totalpass_place_api_key"]
-    token = await get_booking_token(place_api_key)
+    token = await get_booking_token(sucursal["totalpass_place_api_key"])
 
-    # Convertir horario UTC → CDMX (UTC-6)
     from datetime import datetime, timedelta
     dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
     dt_cdmx = dt_utc - timedelta(hours=6)
+    event_date = dt_cdmx.strftime("%Y-%m-%d")
+    start_time = dt_cdmx.strftime("%I:%M %p")
 
-    event_date = dt_cdmx.strftime("%Y-%m-%d")   # "2026-09-10"
-    start_time = dt_cdmx.strftime("%I:%M %p")   # "07:55 AM"
-
-    # Obtener reservas activas
-    reservas_res = supabase.table("reservas").select("id", count="exact")\
+    # Slots para TotalPass = capacidad - reservas que ya existan de otros canales
+    reservas_res = supabase.table("reservas").select("origen")\
       .eq("clase_id", clase_id).neq("estatus", "Cancelada").execute()
-    reservas_activas = reservas_res.count or 0
+    otros = sum(1 for r in (reservas_res.data or []) if (r.get("origen") or "") != "TotalPass")
+    slots_iniciales = max(capacidad - otros, 1)
 
-    print(f"Publicando en TotalPass: {nombre} | {event_date} {start_time}")
+    print(f"Publicando en TotalPass: {nombre} | {event_date} {start_time} | slots {slots_iniciales}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
       res = await client.post(
-        f"{BOOKING_BASE_URL}/partner/event-occurrence",  # ← endpoint correcto
+        f"{BOOKING_BASE_URL}/partner/event-occurrence",
         headers={
           "Authorization": f"Bearer {token}",
           "Content-Type":  "application/json",
@@ -276,7 +256,7 @@ async def publicar_clase_totalpass(req: dict):
           "title":       nombre,
           "responsible": coach,
           "duration":    duracion,
-          "slots": max(0, capacidad - reservas_activas),
+          "slots":       slots_iniciales,
           "planId":      plan_id,
           "eventDate":   event_date,
           "startTime":   start_time,
@@ -285,12 +265,10 @@ async def publicar_clase_totalpass(req: dict):
           "description": descripcion or nombre,
         }
       )
-      print("TotalPass publicar clase:", res.status_code, res.text)
+      print("TotalPass publicar clase:", res.status_code, res.text[:300])
       res.raise_for_status()
-      print("TotalPass publicar clase:", res.status_code, res.text)
       data = res.json()
 
-    # Leer occurrenceUuid del response
     occurrence_uuid = data.get("eventOccurrenceUuid")
     print(f"UUID guardado: {occurrence_uuid}")
 
@@ -310,64 +288,64 @@ async def publicar_clase_totalpass(req: dict):
   except Exception as e:
     raise HTTPException(status_code=500, detail=str(e))
 
+
+# Se mantiene por compatibilidad con código viejo; lo nuevo debe usar /sync/cupos
 @router.post("/actualizar-cupos")
 async def actualizar_cupos_totalpass(req: dict):
-    occurrence_uuid = req.get("occurrence_uuid")
-    sucursal_id     = req.get("sucursal_id")
-    slots           = req.get("slots")  # cupos totales disponibles para TotalPass
+  occurrence_uuid = req.get("occurrence_uuid")
+  sucursal_id     = req.get("sucursal_id")
+  slots           = max(int(req.get("slots") or 1), 1)
 
-    if not occurrence_uuid or not sucursal_id:
-        raise HTTPException(status_code=400, detail="Faltan parámetros")
+  if not occurrence_uuid or not sucursal_id:
+    raise HTTPException(status_code=400, detail="Faltan parámetros")
 
-    place_api_key = get_place_api_key(sucursal_id)
-    token         = await get_booking_token(place_api_key)
+  token = await get_booking_token(get_place_api_key(sucursal_id))
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.put(
-            f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}/slot",  # ← agrega /slot
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
-            json={"slots": slots},
-        )
-        print(f"TotalPass actualizar cupos: {res.status_code} {res.text}")
+  async with httpx.AsyncClient(timeout=15.0) as client:
+    res = await client.put(
+      f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}/slot",
+      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
+      json={"slots": slots},
+    )
+    print(f"TotalPass actualizar cupos: {res.status_code} {res.text[:200]}")
 
-    return {"ok": True, "slots": slots}
+  return {"ok": True, "slots": slots}
 
 
 @router.post("/actualizar-clase")
 async def actualizar_clase_totalpass(req: dict):
-    print("actualizar-clase payload:", req)
-    occurrence_uuid  = req.get("occurrence_uuid")
-    sucursal_id      = req.get("sucursal_id")
-    horario          = req.get("horario")
-    duracion_minutos = req.get("duracion_minutos")
-    capacidad_max    = req.get("capacidad_max")
-    nombre           = req.get("nombre")
-    coach            = req.get("coach", "Navy Coach")
+  print("actualizar-clase payload:", req)
+  occurrence_uuid  = req.get("occurrence_uuid")
+  sucursal_id      = req.get("sucursal_id")
+  horario          = req.get("horario")
+  duracion_minutos = req.get("duracion_minutos")
+  capacidad_max    = req.get("capacidad_max")
+  nombre           = req.get("nombre")
+  coach            = req.get("coach", "Navy Coach")
 
-    if not occurrence_uuid or not sucursal_id:
-        raise HTTPException(status_code=400, detail="Faltan parámetros")
+  if not occurrence_uuid or not sucursal_id:
+    raise HTTPException(status_code=400, detail="Faltan parámetros")
 
-    place_api_key = get_place_api_key(sucursal_id)
-    token         = await get_booking_token(place_api_key)
+  token = await get_booking_token(get_place_api_key(sucursal_id))
 
-    payload = {}
-    if nombre:           payload["title"]     = nombre
-    if coach:            payload["responsible"] = coach
-    if duracion_minutos: payload["duration"]  = duracion_minutos
-    if capacidad_max:    payload["slots"]     = capacidad_max
-    if horario:
-        from datetime import datetime, timedelta
-        dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
-        dt_cdmx = dt_utc - timedelta(hours=6)
-        payload["eventDate"] = dt_cdmx.strftime("%Y-%m-%d")
-        payload["startTime"] = dt_cdmx.strftime("%I:%M %p").lstrip("0")
+  payload = {}
+  if nombre:           payload["title"]       = nombre
+  if coach:            payload["responsible"] = coach
+  if duracion_minutos: payload["duration"]    = duracion_minutos
+  if capacidad_max:    payload["slots"]       = capacidad_max
+  if horario:
+    from datetime import datetime, timedelta
+    dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
+    dt_cdmx = dt_utc - timedelta(hours=6)
+    payload["eventDate"] = dt_cdmx.strftime("%Y-%m-%d")
+    payload["startTime"] = dt_cdmx.strftime("%I:%M %p").lstrip("0")
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.put(
-            f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
-            json=payload,
-        )
-        print(f"TotalPass actualizar clase: {res.status_code} {res.text}")
+  async with httpx.AsyncClient(timeout=15.0) as client:
+    res = await client.put(
+      f"{BOOKING_BASE_URL}/partner/event-occurrence/{occurrence_uuid}",
+      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "accept": "application/json"},
+      json=payload,
+    )
+    print(f"TotalPass actualizar clase: {res.status_code} {res.text[:200]}")
 
-    return {"ok": True}
+  return {"ok": True}
