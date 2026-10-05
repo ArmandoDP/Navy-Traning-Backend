@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from routers import crons, pagos, sincronizacion, totalpass, totalpass_booking, clientes, clases, wellhub, confirmar_reserva
+from routers import crons, editar_clase, pagos, sincronizacion, totalpass, totalpass_booking, clientes, clases, wellhub, confirmar_reserva
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
   check_recordatorios_clase,
@@ -33,6 +33,7 @@ app.include_router(clientes.router,          prefix="/clientes")
 app.include_router(clases.router,            prefix="/clases")
 app.include_router(wellhub.router,           prefix="/wellhub")
 app.include_router(sincronizacion.router,     prefix="/sync")
+app.include_router(editar_clase.router, prefix="/clases")
 app.include_router(confirmar_reserva.router)  # sin prefix
 
 # Scheduler
