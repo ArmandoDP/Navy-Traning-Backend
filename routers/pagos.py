@@ -11,6 +11,11 @@ router = APIRouter()
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://crm.navytrainingcenter.com")
 
+
+def _orkestapay_apagado():
+  if os.getenv("ORKESTAPAY_LEGACY", "off") != "on":
+    raise HTTPException(status_code=410, detail="Este método de pago ya no está disponible. Actualiza la app para pagar con Stripe.")
+
 class PagoRequest(BaseModel):
   cliente_id:        str
   paquete_id:        str
@@ -77,6 +82,7 @@ async def _enviar_comprobante_app(
 
 @router.post("/procesar")
 async def procesar_pago(req: PagoRequest):
+  _orkestapay_apagado()
   cliente_res = supabase.table("clientes").select("nombre_completo, email, sucursal_id")\
     .eq("id", req.cliente_id).single().execute()
   paquete_res = supabase.table("paquetes")\
@@ -155,6 +161,7 @@ async def procesar_pago(req: PagoRequest):
 
 @router.post("/crear-checkout")
 async def crear_checkout(req: CrearCheckoutRequest):
+  _orkestapay_apagado()
   from services.orkestapay import get_access_token_sucursal, crear_customer
 
   paquete_res = supabase.table("paquetes").select("nombre").eq("id", req.paquete_id).single().execute()
@@ -218,6 +225,7 @@ async def crear_checkout(req: CrearCheckoutRequest):
 
 @router.post("/confirmar-checkout")
 async def confirmar_checkout(req: ConfirmarCheckoutRequest):
+  _orkestapay_apagado()
   from datetime import date, timedelta
 
   # Cliente
@@ -305,6 +313,7 @@ async def confirmar_checkout(req: ConfirmarCheckoutRequest):
 
 @router.post("/pagar-penalizacion")
 async def pagar_penalizacion(req: PagarPenalizacionRequest):
+  _orkestapay_apagado()
   from services.orkestapay import get_access_token_sucursal
 
   pen_res = supabase.table("penalizaciones_noshow")\
@@ -357,6 +366,7 @@ async def pagar_penalizacion(req: PagarPenalizacionRequest):
 
 @router.post("/confirmar-penalizacion")
 async def confirmar_penalizacion(req: dict):
+  _orkestapay_apagado()
   penalizacion_id = req.get("penalizacion_id")
   order_id        = req.get("order_id")
 
@@ -370,6 +380,7 @@ async def confirmar_penalizacion(req: dict):
 
 @router.post("/crear-customer")
 async def crear_customer_endpoint(req: dict):
+  _orkestapay_apagado()
   cliente_id  = req.get("cliente_id")
   sucursal_id = req.get("sucursal_id")
 
@@ -393,6 +404,7 @@ async def crear_customer_endpoint(req: dict):
 
 @router.get("/metodos-pago/{cliente_id}")
 async def listar_metodos_pago_endpoint(cliente_id: str):
+  _orkestapay_apagado()
   from services.orkestapay import listar_metodos_pago
 
   cli = supabase.table("clientes").select("orkestapay_customer_id, sucursal_id")\
@@ -407,6 +419,7 @@ async def listar_metodos_pago_endpoint(cliente_id: str):
 
 @router.post("/cobrar-tarjeta")
 async def cobrar_tarjeta_endpoint(req: dict):
+  _orkestapay_apagado()
   from services.orkestapay import cobrar_tarjeta_guardada
   from datetime import date
 

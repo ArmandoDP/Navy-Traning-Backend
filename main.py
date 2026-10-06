@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from routers import crons, editar_clase, pagos, sincronizacion, totalpass, totalpass_booking, clientes, clases, wellhub, confirmar_reserva
+from routers import (
+  crons, pagos, totalpass, totalpass_booking, clientes, clases, wellhub,
+  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
   check_recordatorios_clase,
@@ -26,15 +29,16 @@ app.add_middleware(
 
 # Routers
 app.include_router(crons.router,             prefix="/crons")
-app.include_router(pagos.router,             prefix="/pagos")
+app.include_router(pagos.router,             prefix="/pagos")              # OrkestaPay (apagado)
 app.include_router(totalpass.router,         prefix="/totalpass")
 app.include_router(totalpass_booking.router, prefix="/totalpass-booking")
 app.include_router(clientes.router,          prefix="/clientes")
 app.include_router(clases.router,            prefix="/clases")
+app.include_router(editar_clase.router,      prefix="/clases")             # /clases/actualizar
 app.include_router(wellhub.router,           prefix="/wellhub")
-app.include_router(sincronizacion.router,     prefix="/sync")
-app.include_router(editar_clase.router, prefix="/clases")
-app.include_router(confirmar_reserva.router)  # sin prefix
+app.include_router(sincronizacion.router,    prefix="/sync")               # /sync/cupos
+app.include_router(stripe_pagos.router,      prefix="/stripe")             # pagos con Stripe
+app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler
 scheduler = AsyncIOScheduler()
@@ -45,7 +49,6 @@ async def startup():
   scheduler.add_job(check_membresias_por_vencer, 'cron', hour=14, minute=0)
   scheduler.add_job(check_no_shows,              'cron', minute=30)
   scheduler.add_job(check_clases_en_curso,       'cron', minute='*/15')
-  scheduler.add_job(lambda: ..., 'cron', hour='*', minute=0)  # cada hora
   scheduler.start()
 
 @app.on_event("shutdown")
