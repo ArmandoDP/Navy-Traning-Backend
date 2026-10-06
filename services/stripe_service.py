@@ -104,6 +104,24 @@ def eliminar_tarjeta(cliente_id: str, pm_id: str):
   stripe.PaymentMethod.detach(pm_id)
 
 
+def comision_de(charge) -> float | None:
+  """Comisión real que cobró Stripe (incluye el costo de MSI). None si aún no está disponible."""
+  if not charge:
+    return None
+  try:
+    if isinstance(charge, str):
+      charge = stripe.Charge.retrieve(charge)
+    bt = charge.get("balance_transaction")
+    if not bt:
+      return None
+    if isinstance(bt, str):
+      bt = stripe.BalanceTransaction.retrieve(bt)
+    return (bt.get("fee") or 0) / 100
+  except Exception as e:
+    print("No se pudo leer la comisión:", e)
+    return None
+
+
 def etiqueta_metodo(charge) -> str:
   if not charge:
     return "Tarjeta"
@@ -264,6 +282,7 @@ def cobrar_tarjeta_guardada(cliente_id: str, monto: float, concepto: str, metada
     "payment_intent_id": pi.id,
     "receipt_url":       ch.receipt_url if ch else None,
     "metodo":            etiqueta_metodo(ch),
+    "comision":          comision_de(ch),
     "mensaje":           None if pi.status == "succeeded" else "El banco pidió autorización; el cliente debe pagar desde la app",
   }
 
@@ -279,7 +298,8 @@ async def cobrar_penalizacion_automatica(penalizacion_id: str) -> dict:
   supabase.table("penalizaciones_noshow").update({"intentos_cobro": (pen.get("intentos_cobro") or 0) + 1})\
     .eq("id", pen["id"]).execute()
   if res.get("ok"):
-    await marcar_penalizacion_pagada(pen, res.get("payment_intent_id"), res.get("receipt_url"), res.get("metodo"))
+    await marcar_penalizacion_pagada(pen, res.get("payment_intent_id"), res.get("receipt_url"), res.get("metodo"),
+                                     comision=res.get("comision"))
   return res
 
 
@@ -399,3 +419,63 @@ def hoja_tarjeta(cliente_id: str) -> dict:
   )
   return {"customer": customer, "ephemeral_key": _ephemeral_key(customer),
           "setup_intent": si.client_secret, "intent_id": si.id}
+
+
+# ─── Links de pago (nuevos clientes) ─────────────────────────────────────────
+def _precio_stripe(paq: dict, monto: float, recurrente: bool) -> str:
+  dias = paq.get("vigencia_dias") or 30
+  key = f"navy_{paq['id'].replace('-', '')}_{centavos(monto)}_{'r' + str(dias) if recurrente else 'u'}"
+  existente = stripe.Price.list(lookup_keys=[key], active=True, limit=1).data
+  if existente:
+    return existente[0].id
+  kw = dict(product=_producto(paq), currency="mxn", unit_amount=centavos(monto), lookup_key=key)
+  if recurrente:
+    kw["recurring"] = intervalo(dias)
+  return stripe.Price.create(**kw).id
+
+
+def crear_link_pago(paquete_id: str, sucursal_id: str, staff_id: str | None) -> dict:
+  paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus", id=paquete_id)
+  if not paq or (paq.get("estatus") and paq["estatus"] != "Activo"):
+    raise ValueError("Este paquete no está disponible")
+  monto = precio_paquete(paq, sucursal_id)
+  if monto <= 0:
+    raise ValueError("El paquete no tiene precio en esta sucursal")
+  rec  = bool(paq.get("es_recurrente"))
+  meta = _meta({"tipo": "link_nuevo", "paquete_id": paquete_id, "sucursal_id": sucursal_id,
+                "staff_id": staff_id, "monto": monto})
+  desc = f"{paq['nombre']} — Navy Training Center"
+  kw = dict(
+    line_items=[{"price": _precio_stripe(paq, monto, rec), "quantity": 1}],
+    metadata=meta,
+    after_completion={"type": "redirect", "redirect": {
+      "url": f"{FRONTEND_URL}/pago/completado?session_id={{CHECKOUT_SESSION_ID}}&canal=link"}},
+    phone_number_collection={"enabled": True},
+    custom_fields=[{"key": "nombre", "type": "text",
+                    "label": {"type": "custom", "custom": "Nombre completo"}}],
+  )
+  if rec:
+    kw["subscription_data"] = {"metadata": meta, "description": desc}
+  else:
+    kw["payment_intent_data"] = {"metadata": meta, "description": desc}
+    kw["customer_creation"] = "always"
+  link = stripe.PaymentLink.create(**kw)
+
+  fila = supabase.table("links_pago").insert({
+    "stripe_payment_link_id": link.id,
+    "url":                    link.url,
+    "paquete_id":             paquete_id,
+    "sucursal_id":            sucursal_id,
+    "monto":                  monto,
+    "recurrente":             rec,
+    "creado_por":             staff_id,
+  }).execute().data[0]
+  return {**fila, "paquete": paq["nombre"]}
+
+
+def desactivar_link(link_id: str):
+  fila = _uno("links_pago", "id, stripe_payment_link_id", id=link_id)
+  if not fila:
+    raise ValueError("Link no encontrado")
+  stripe.PaymentLink.modify(fila["stripe_payment_link_id"], active=False)
+  supabase.table("links_pago").update({"activo": False}).eq("id", link_id).execute()

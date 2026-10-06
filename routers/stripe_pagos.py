@@ -9,7 +9,7 @@ from services.email      import enviar_comprobante_compra
 from services import stripe_service as ss
 from services.stripe_activacion import (
   _uno, CDMX, activar_paquete, marcar_penalizacion_pagada, registrar_oxxo_pendiente,
-  marcar_pago_fallido, push_cliente, correo_simple, membresia_activa,
+  marcar_pago_fallido, push_cliente, correo_simple, membresia_activa, asegurar_cliente,
 )
 
 router = APIRouter()
@@ -202,9 +202,10 @@ async def cobrar_tarjeta(request: Request):
     "metodo_pago":              res.get("metodo") or "Tarjeta guardada",
     "canal":                    "Stripe",
     "concepto":                 concepto,
-    "fecha_pago":               datetime.now(timezone.utc).isoformat(),
+    "fecha_pago":               datetime.now(CDMX).isoformat(),
     "stripe_payment_intent_id": res.get("payment_intent_id"),
     "receipt_url":              res.get("receipt_url"),
+    "comision":                 res.get("comision"),
     "metadata":                 {"venta_id": b.get("venta_id"), "staff_id": staff.get("id")},
   }).execute()
 
@@ -234,6 +235,51 @@ async def cobrar_tarjeta(request: Request):
     f"Se cobraron ${monto:,.2f} a tu {res.get('metodo')} por {concepto}. Te enviamos tu comprobante.",
     {"tipo": "cargo_tarjeta"})
   return {"ok": True, "metodo": res.get("metodo"), "receipt_url": res.get("receipt_url")}
+
+
+# ─── Links de pago para nuevos clientes (CRM) ────────────────────────────────
+@router.post("/links")
+async def crear_link(request: Request):
+  staff = staff_de_sesion(request)
+  b = await request.json()
+  if not b.get("paquete_id") or not b.get("sucursal_id"):
+    raise HTTPException(status_code=400, detail="Elige paquete y sucursal")
+  try:
+    link = ss.crear_link_pago(b["paquete_id"], b["sucursal_id"], staff.get("id"))
+  except Exception as e:
+    _error(e)
+  quien = " ".join(f"{staff.get('nombre') or ''} {staff.get('primer_apellido') or ''}".split())
+  supabase.table("actividad_log").insert({
+    "tipo":        "link_pago_creado",
+    "descripcion": f"{quien} creó un link de pago de {link['paquete']} por ${float(link['monto']):,.2f}",
+    "tabla":       "links_pago",
+    "accion":      "INSERT",
+    "metadata":    {"link_id": link["id"], "url": link["url"], "paquete_id": b["paquete_id"]},
+    "sucursal_id": b["sucursal_id"],
+    "staff_id":    staff.get("id"),
+  }).execute()
+  return link
+
+
+@router.get("/links")
+async def listar_links(request: Request, sucursal_id: str | None = None):
+  staff_de_sesion(request)
+  q = supabase.table("links_pago")\
+    .select("*, paquetes(nombre), sucursales(nombre), staff(nombre, primer_apellido)")\
+    .eq("activo", True).order("created_at", desc=True).limit(50)
+  if sucursal_id:
+    q = q.eq("sucursal_id", sucursal_id)
+  return {"links": q.execute().data or []}
+
+
+@router.post("/links/{link_id}/desactivar")
+async def desactivar_link(link_id: str, request: Request):
+  staff_de_sesion(request)
+  try:
+    ss.desactivar_link(link_id)
+    return {"ok": True}
+  except Exception as e:
+    _error(e)
 
 
 # ─── Estado de un checkout (la app lo consulta al volver del pago) ──────────
@@ -308,6 +354,8 @@ async def _procesar(event):
   if tipo.startswith("checkout.session."):
     s = stripe.checkout.Session.retrieve(obj["id"], expand=["payment_intent.latest_charge"])
     meta = dict(s.metadata or {})
+    if s.get("payment_link") and not meta.get("cliente_id"):
+      meta = await _meta_desde_link(s, contar_uso=(tipo == "checkout.session.completed"))
 
     if s.mode == "setup":
       if tipo == "checkout.session.completed":
@@ -373,7 +421,8 @@ async def _pago_unico(s, meta):
   if meta.get("tipo") == "penalizacion":
     pen = _uno("penalizaciones_noshow", "id, cliente_id, monto, clase_id, estatus", id=meta.get("penalizacion_id"))
     if pen and pen.get("estatus") != "Pagado":
-      await marcar_penalizacion_pagada(pen, pi.id if pi else None, ch.receipt_url if ch else None, metodo, session_id=s.id)
+      await marcar_penalizacion_pagada(pen, pi.id if pi else None, ch.receipt_url if ch else None, metodo,
+                                       session_id=s.id, comision=ss.comision_de(ch))
       await push_cliente(pen["cliente_id"], "✅ Pago recibido",
         "Tu penalización quedó liquidada. Ya puedes seguir reservando.", {"tipo": "penalizacion_pagada"})
     return
@@ -381,6 +430,7 @@ async def _pago_unico(s, meta):
     cliente_id=meta["cliente_id"], paquete_id=meta["paquete_id"], monto=(s.amount_total or 0) / 100,
     sucursal_id=meta.get("sucursal_id"), metodo=metodo, origen=meta.get("origen", "app"),
     session_id=s.id, payment_intent_id=pi.id if pi else None, receipt_url=ch.receipt_url if ch else None,
+    comision=ss.comision_de(ch),
   )
 
 
@@ -415,6 +465,13 @@ async def _factura_pagada(inv):
   if not sub or (inv.amount_paid or 0) <= 0:
     return  # factura de $0 (periodo programado)
   meta = dict(sub.metadata or {})
+  if not meta.get("cliente_id") and meta.get("tipo") == "link_nuevo":
+    # Suscripción pagada con link: puede llegar antes que el checkout.session.completed
+    cliente_id = await asegurar_cliente(
+      email=inv.customer_email, nombre=inv.customer_name, telefono=inv.customer_phone,
+      sucursal_id=meta.get("sucursal_id"), stripe_customer_id=inv.customer)
+    meta = {**meta, "tipo": "paquete", "cliente_id": cliente_id, "origen": "link"}
+    stripe.Subscription.modify(sub.id, metadata=meta)
   if not meta.get("cliente_id") or not meta.get("paquete_id"):
     print("Factura sin metadata de Navy:", inv.id)
     return
@@ -427,6 +484,7 @@ async def _factura_pagada(inv):
     receipt_url=inv.hosted_invoice_url,
     fecha_fin_stripe=datetime.fromtimestamp(periodo_fin, CDMX).date() if periodo_fin else None,
     es_renovacion=inv.billing_reason == "subscription_cycle",
+    comision=ss.comision_de(inv.charge),
   )
 
 
@@ -488,7 +546,7 @@ async def _pi_exitoso(pi):
   if meta.get("tipo") == "penalizacion":
     pen = _uno("penalizaciones_noshow", "id, cliente_id, monto, clase_id, estatus", id=meta.get("penalizacion_id"))
     if pen and pen.get("estatus") != "Pagado":
-      await marcar_penalizacion_pagada(pen, pi.id, ch.receipt_url if ch else None, metodo)
+      await marcar_penalizacion_pagada(pen, pi.id, ch.receipt_url if ch else None, metodo, comision=ss.comision_de(ch))
       await push_cliente(pen["cliente_id"], "✅ Pago recibido",
         "Tu penalización quedó liquidada. Ya puedes seguir reservando.", {"tipo": "penalizacion_pagada"})
     return
@@ -497,6 +555,7 @@ async def _pi_exitoso(pi):
       cliente_id=meta["cliente_id"], paquete_id=meta["paquete_id"], monto=(pi.amount or 0) / 100,
       sucursal_id=meta.get("sucursal_id"), metodo=metodo, origen=meta.get("origen", "app"),
       payment_intent_id=pi.id, receipt_url=ch.receipt_url if ch else None,
+      comision=ss.comision_de(ch),
     )
 
 
@@ -529,3 +588,28 @@ async def _setup_exitoso(si):
     inicio = datetime.fromtimestamp(int(meta["trial_end"]), CDMX).strftime("%d/%m/%Y")
     await push_cliente(cliente_id, "🔄 ¡Listo! Renovación activada",
       f"Tu plan se renovará automáticamente el {inicio}. No se te cobra nada hoy.", {"tipo": "renovacion_activada"})
+
+
+async def _meta_desde_link(s, contar_uso: bool) -> dict:
+  """Pago hecho con un link de pago: identifica o crea al cliente y arma los datos de Navy."""
+  link = stripe.PaymentLink.retrieve(s.payment_link)
+  lm = dict(link.metadata or {})
+  if lm.get("tipo") != "link_nuevo":
+    return {}
+  det = s.get("customer_details") or {}
+  nombre = None
+  for campo in (s.get("custom_fields") or []):
+    if campo.get("key") == "nombre" and campo.get("text"):
+      nombre = campo["text"].get("value")
+  cliente_id = await asegurar_cliente(
+    email=det.get("email"), nombre=nombre or det.get("name"), telefono=det.get("phone"),
+    sucursal_id=lm.get("sucursal_id"), stripe_customer_id=s.get("customer"))
+
+  meta = {**lm, "tipo": "paquete", "cliente_id": cliente_id, "origen": "link"}
+  if s.mode == "subscription" and s.get("subscription"):
+    stripe.Subscription.modify(s.subscription, metadata=meta)
+  if contar_uso:
+    fila = _uno("links_pago", "id, usos", stripe_payment_link_id=link.id)
+    if fila:
+      supabase.table("links_pago").update({"usos": (fila.get("usos") or 0) + 1}).eq("id", fila["id"]).execute()
+  return meta

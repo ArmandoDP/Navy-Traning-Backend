@@ -108,7 +108,8 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
                           metodo: str, origen: str, session_id: str | None = None,
                           payment_intent_id: str | None = None, invoice_id: str | None = None,
                           subscription_id: str | None = None, receipt_url: str | None = None,
-                          fecha_fin_stripe: date | None = None, es_renovacion: bool = False) -> dict:
+                          fecha_fin_stripe: date | None = None, es_renovacion: bool = False,
+                          comision: float | None = None) -> dict:
   # Idempotencia
   if invoice_id and _uno("pagos", "id", stripe_invoice_id=invoice_id):
     return {"ok": True, "duplicado": True}
@@ -145,11 +146,12 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     "metodo_pago":                metodo,
     "canal":                      "Stripe",
     "concepto":                   concepto,
-    "fecha_pago":                 datetime.now(timezone.utc).isoformat(),
+    "fecha_pago":                 datetime.now(CDMX).isoformat(),
     "stripe_checkout_session_id": session_id,
     "stripe_payment_intent_id":   payment_intent_id,
     "stripe_invoice_id":          invoice_id,
     "receipt_url":                receipt_url,
+    "comision":                   comision,
     "metadata":                   {"origen": origen, "paquete_id": paquete_id, "subscription_id": subscription_id},
   }
   if pago_previo:  # OXXO que ya estaba pendiente
@@ -198,7 +200,7 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
 
 
 async def marcar_penalizacion_pagada(pen: dict, payment_intent_id: str | None, receipt_url: str | None,
-                                     metodo: str, session_id: str | None = None):
+                                     metodo: str, session_id: str | None = None, comision: float | None = None):
   if payment_intent_id and _uno("pagos", "id", stripe_payment_intent_id=payment_intent_id):
     return
   supabase.table("penalizaciones_noshow").update({
@@ -215,10 +217,11 @@ async def marcar_penalizacion_pagada(pen: dict, payment_intent_id: str | None, r
     "metodo_pago":                metodo,
     "canal":                      "Stripe",
     "concepto":                   "Penalización No Show",
-    "fecha_pago":                 datetime.now(timezone.utc).isoformat(),
+    "fecha_pago":                 datetime.now(CDMX).isoformat(),
     "stripe_checkout_session_id": session_id,
     "stripe_payment_intent_id":   payment_intent_id,
     "receipt_url":                receipt_url,
+    "comision":                   comision,
     "metadata":                   {"penalizacion_id": pen["id"], "clase_id": pen.get("clase_id")},
   }).execute()
 
@@ -238,7 +241,7 @@ async def registrar_oxxo_pendiente(*, cliente_id: str, monto: float, concepto: s
     "metodo_pago":                "OXXO",
     "canal":                      "Stripe",
     "concepto":                   concepto,
-    "fecha_pago":                 datetime.now(timezone.utc).isoformat(),
+    "fecha_pago":                 datetime.now(CDMX).isoformat(),
     "stripe_checkout_session_id": session_id,
     "stripe_payment_intent_id":   payment_intent_id,
     "receipt_url":                voucher_url,
@@ -252,3 +255,73 @@ async def registrar_oxxo_pendiente(*, cliente_id: str, monto: float, concepto: s
 def marcar_pago_fallido(session_id: str, estatus: str = "Fallido"):
   supabase.table("pagos").update({"estatus": estatus})\
     .eq("stripe_checkout_session_id", session_id).eq("estatus", "Pendiente").execute()
+
+
+# ─── Clientes nuevos que pagan con un link ───────────────────────────────────
+async def _crear_acceso(cliente_id: str, email: str):
+  """Usuario de Supabase Auth para que entre a la app con su correo y código (sin contraseña)."""
+  url = os.getenv("SUPABASE_URL")
+  key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+  try:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+      r = await client.post(f"{url}/auth/v1/admin/users",
+        headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"email": email, "email_confirm": True})
+    if r.status_code in (200, 201) and r.json().get("id"):
+      supabase.table("clientes").update({"supabase_user_id": r.json()["id"]}).eq("id", cliente_id).execute()
+    # 422 = ya existía un usuario con ese correo: puede entrar igual
+  except Exception as e:
+    print("Error creando acceso:", e)
+
+
+async def asegurar_cliente(*, email: str | None, nombre: str | None, telefono: str | None,
+                           sucursal_id: str | None, stripe_customer_id: str | None) -> str:
+  if not email:
+    raise ValueError("El pago no trae correo")
+  email = email.strip().lower()
+  provisional = email.split("@")[0]
+  nombre = " ".join((nombre or "").split()) or None
+
+  r = supabase.table("clientes").select("id, nombre_completo, stripe_customer_id, supabase_user_id")\
+    .ilike("email", email).limit(1).execute()
+  if r.data:
+    c = r.data[0]
+    upd = {}
+    if stripe_customer_id and not c.get("stripe_customer_id"):
+      upd["stripe_customer_id"] = stripe_customer_id
+    if nombre and (c.get("nombre_completo") or "") in ("", provisional):
+      upd["nombre_completo"] = nombre
+    if upd:
+      supabase.table("clientes").update(upd).eq("id", c["id"]).execute()
+    if not c.get("supabase_user_id"):
+      await _crear_acceso(c["id"], email)
+    return c["id"]
+
+  try:
+    nuevo = supabase.table("clientes").insert({
+      "nombre_completo":     nombre or provisional,
+      "email":               email,
+      "telefono":            telefono,
+      "sucursal_id":         sucursal_id,
+      "estatus":             "Activo",
+      "origen":              "Link de pago",
+      "fecha_alta_original": hoy_cdmx().isoformat(),
+      "stripe_customer_id":  stripe_customer_id,
+    }).execute()
+    cliente_id = nuevo.data[0]["id"]
+  except Exception:
+    # Otro evento lo creó al mismo tiempo
+    r = supabase.table("clientes").select("id").ilike("email", email).limit(1).execute()
+    if r.data:
+      return r.data[0]["id"]
+    raise
+
+  await _crear_acceso(cliente_id, email)
+  try:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+      await client.post(f"{FRONTEND_URL}/api/correo/bienvenida-cliente",
+                        json={"email": email, "nombre": nombre or provisional})
+  except Exception as e:
+    print("Error correo bienvenida:", e)
+  print(f"🆕 Cliente creado por link de pago: {email}")
+  return cliente_id
