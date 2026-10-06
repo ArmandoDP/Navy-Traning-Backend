@@ -331,7 +331,7 @@ async def _procesar(event):
 
     if s.payment_status == "paid":
       await _pago_unico(s, meta)
-    elif tipo == "checkout.session.completed":
+    elif tipo == "checkout.session.completed" and meta.get("cliente_id"):
       pi = s.payment_intent
       oxxo = ((pi.get("next_action") or {}).get("oxxo_display_details") or {}) if pi else {}
       await registrar_oxxo_pendiente(
@@ -364,6 +364,9 @@ async def _procesar(event):
 
 
 async def _pago_unico(s, meta):
+  if not meta.get("cliente_id") or (meta.get("tipo") == "paquete" and not meta.get("paquete_id")):
+    print(f"⚠️ Pago {s.id} sin datos de Navy (¿link manual de Stripe?) — se ignora")
+    return
   pi = s.payment_intent
   ch = pi.latest_charge if pi else None
   metodo = ss.etiqueta_metodo(ch)
@@ -478,7 +481,7 @@ def _reembolso(charge):
 async def _pi_exitoso(pi):
   """Pagos del formulario nativo. Los de Checkout, facturas y cargos directos se procesan en otro lado."""
   meta = dict(pi.metadata or {})
-  if meta.get("flujo") != "sheet" or pi.invoice:
+  if meta.get("flujo") != "sheet" or pi.invoice or not meta.get("cliente_id"):
     return
   ch = pi.latest_charge
   metodo = ss.etiqueta_metodo(ch)
