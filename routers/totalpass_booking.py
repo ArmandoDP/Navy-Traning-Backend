@@ -50,16 +50,31 @@ VENTANA_CANCELACION_MIN = int(os.getenv("CANCELACION_MIN", "720"))   # 12 h: can
 
 async def _cancelar_booking_totalpass(slot_id: str, body: dict):
   """El usuario canceló en TotalPass: liberar su lugar en Navy."""
-  bk = supabase.table("totalpass_bookings").select("id, clase_id, cliente_id, reserva_id, estatus, email")\
+  bk = supabase.table("totalpass_bookings")\
+    .select("id, clase_id, cliente_id, reserva_id, estatus, email, occurrence_uuid, principal")\
     .eq("slot_id", slot_id).limit(1).execute()
   if not bk.data:
     print(f"Cancelación TotalPass de slot desconocido {slot_id}")
     return {"received": True, "cancelado": False}
   b = bk.data[0]
+
+  # Si cancelaron con el ID del aviso "alias", se busca la reserva principal
+  if b.get("principal") is False and b.get("email"):
+    pr = supabase.table("totalpass_bookings")\
+      .select("id, clase_id, cliente_id, reserva_id, estatus, email, occurrence_uuid, principal")\
+      .eq("occurrence_uuid", b["occurrence_uuid"]).ilike("email", b["email"])\
+      .eq("principal", True).neq("estatus", "Cancelado").limit(1).execute()
+    if pr.data:
+      b = pr.data[0]
+
   if b.get("estatus") == "Cancelado":
     return {"received": True, "duplicado": True}
 
+  # Marcar como cancelados la principal y sus alias
   supabase.table("totalpass_bookings").update({"estatus": "Cancelado"}).eq("id", b["id"]).execute()
+  if b.get("email"):
+    supabase.table("totalpass_bookings").update({"estatus": "Cancelado"})\
+      .eq("occurrence_uuid", b["occurrence_uuid"]).ilike("email", b["email"]).eq("principal", False).execute()
 
   if b.get("reserva_id"):
     supabase.table("reservas").update({"estatus": "Cancelada"}).eq("id", b["reserva_id"]).execute()
@@ -120,13 +135,6 @@ async def totalpass_booking_webhook(request: Request):
     if "cancel" in estado:
       return await _cancelar_booking_totalpass(slot_id, body)
 
-    # Anti-duplicado: el mismo aviso de reserva llegando dos veces
-    existente_slot = supabase.table("totalpass_bookings").select("id")\
-      .eq("slot_id", slot_id).limit(1).execute()
-    if existente_slot.data:
-      print(f"Slot {slot_id} ya procesado — ignorando webhook duplicado")
-      return { "received": True, "duplicado": True }
-
     clase_res = supabase.table("clases").select("id, capacidad_max, sucursal_id")\
       .eq("totalpass_occurrence_uuid", str(occurrence_uuid)).limit(1).execute()
     clase = clase_res.data[0] if clase_res.data else None
@@ -134,6 +142,40 @@ async def totalpass_booking_webhook(request: Request):
     if not clase:
       print(f"Clase no encontrada para occurrence_uuid: {occurrence_uuid}")
       return { "received": True, "error": "Clase no encontrada" }
+
+    # Apartar el slot: si el mismo aviso llega dos veces al mismo tiempo, el segundo choca
+    # con el índice único y se descarta (antes podía rechazar la reserva que el primero confirmó)
+    # TotalPass manda DOS avisos por reserva ("active" y "confirmed") con IDs distintos.
+    # El primero que llega es la reserva principal; el otro se guarda como alias y no se procesa.
+    try:
+      supabase.table("totalpass_bookings").insert({
+        "slot_id":         slot_id,
+        "email":           email,
+        "nombre":          nombre,
+        "occurrence_uuid": str(occurrence_uuid),
+        "clase_id":        clase["id"],
+        "sucursal_id":     clase.get("sucursal_id"),
+        "estatus":         "Procesando",
+        "principal":       True,
+        "metadata":        body,
+      }).execute()
+    except Exception:
+      try:
+        supabase.table("totalpass_bookings").insert({
+          "slot_id":         slot_id,
+          "email":           email,
+          "nombre":          nombre,
+          "occurrence_uuid": str(occurrence_uuid),
+          "clase_id":        clase["id"],
+          "sucursal_id":     clase.get("sucursal_id"),
+          "estatus":         "Alias",
+          "principal":       False,
+          "metadata":        body,
+        }).execute()
+      except Exception:
+        pass  # el mismo slot_id llegó dos veces
+      print(f"Aviso TotalPass {slot_id} ({estado}) es de una reserva ya registrada — se guarda como alias")
+      return { "received": True, "duplicado": True }
 
     place_api_key = get_place_api_key(clase["sucursal_id"]) if clase.get("sucursal_id") \
       else os.getenv("TOTALPASS_PLACE_API_KEY")
@@ -169,18 +211,11 @@ async def totalpass_booking_webhook(request: Request):
         .neq("estatus", "Cancelada").limit(1).execute()
       reserva_existente = ex.data[0]["id"] if ex.data else None
 
-    supabase.table("totalpass_bookings").insert({
-      "slot_id":         slot_id,
-      "email":           email,
-      "nombre":          nombre,
-      "cliente_id":      cliente_id,
-      "occurrence_uuid": str(occurrence_uuid),
-      "clase_id":        clase["id"],
-      "sucursal_id":     clase.get("sucursal_id"),
-      "estatus":         "Pendiente",
-      "reserva_id":      reserva_existente,
-      "metadata":        body,
-    }).execute()
+    supabase.table("totalpass_bookings").update({
+      "cliente_id": cliente_id,
+      "estatus":    "Pendiente",
+      "reserva_id": reserva_existente,
+    }).eq("slot_id", slot_id).execute()
 
     token = await get_booking_token(place_api_key)
 
