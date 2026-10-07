@@ -45,25 +45,82 @@ async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "re
       return {}
 
 
+VENTANA_CANCELACION_MIN = 60   # cancelar con menos de esto = cancelación tardía (solo genera alerta)
+
+
+async def _cancelar_booking_totalpass(slot_id: str, body: dict):
+  """El usuario canceló en TotalPass: liberar su lugar en Navy."""
+  bk = supabase.table("totalpass_bookings").select("id, clase_id, cliente_id, reserva_id, estatus, email")\
+    .eq("slot_id", slot_id).limit(1).execute()
+  if not bk.data:
+    print(f"Cancelación TotalPass de slot desconocido {slot_id}")
+    return {"received": True, "cancelado": False}
+  b = bk.data[0]
+  if b.get("estatus") == "Cancelado":
+    return {"received": True, "duplicado": True}
+
+  supabase.table("totalpass_bookings").update({"estatus": "Cancelado"}).eq("id", b["id"]).execute()
+
+  if b.get("reserva_id"):
+    supabase.table("reservas").update({"estatus": "Cancelada"}).eq("id", b["reserva_id"]).execute()
+  else:
+    # Bookings viejos sin reserva_id: la reserva TotalPass activa de ese cliente en esa clase
+    q = supabase.table("reservas").select("id").eq("clase_id", b["clase_id"])\
+      .eq("origen", "TotalPass").neq("estatus", "Cancelada")
+    q = q.eq("cliente_id", b["cliente_id"]) if b.get("cliente_id") else q.is_("cliente_id", "null")
+    r = q.limit(1).execute()
+    if r.data:
+      supabase.table("reservas").update({"estatus": "Cancelada"}).eq("id", r.data[0]["id"]).execute()
+
+  await sincronizar_cupos(b["clase_id"])
+
+  # Alerta si canceló muy cerca de la clase
+  try:
+    from datetime import datetime, timezone
+    cl = supabase.table("clases").select("nombre_clase, horario").eq("id", b["clase_id"]).limit(1).execute()
+    if cl.data:
+      inicio = datetime.fromisoformat(cl.data[0]["horario"].replace("Z", "+00:00"))
+      minutos = (inicio - datetime.now(timezone.utc)).total_seconds() / 60
+      if minutos < VENTANA_CANCELACION_MIN:
+        supabase.table("alertas").insert({
+          "tipo":        "no_show",
+          "categoria":   "asistencia",
+          "titulo":      "Cancelación tardía — TotalPass",
+          "descripcion": f"{b.get('email') or 'Usuario'} canceló {cl.data[0]['nombre_clase']} {int(max(minutos, 0))} min antes",
+          "cliente_id":  b.get("cliente_id"),
+          "metadata":    {"slot_id": slot_id},
+        }).execute()
+  except Exception as e:
+    print("Error alerta cancelación tardía:", e)
+
+  print(f"🔓 TotalPass cancelado: slot {slot_id} → lugar liberado")
+  return {"received": True, "cancelado": True}
+
+
 @router.post("/booking/webhook")
 async def totalpass_booking_webhook(request: Request):
   body = await request.json()
   print("TotalPass Booking webhook:", body)
 
   try:
-    user  = body.get("user", {})
-    event = body.get("event", {})
-    slot  = body.get("slot", {})
+    user  = body.get("user", {}) or {}
+    event = body.get("event", {}) or {}
+    slot  = body.get("slot", {}) or {}
 
     slot_id         = slot.get("id")
-    email           = user.get("email")
+    email           = (user.get("email") or "").strip().lower() or None
     nombre          = user.get("name") or ""
     occurrence_uuid = event.get("id")
+    estado          = str(slot.get("status") or "").lower()
 
     if not slot_id:
       return { "received": True, "error": "slot_id faltante" }
 
-    # Anti-duplicado por slot_id
+    # ── Cancelación ──
+    if "cancel" in estado:
+      return await _cancelar_booking_totalpass(slot_id, body)
+
+    # Anti-duplicado: el mismo aviso de reserva llegando dos veces
     existente_slot = supabase.table("totalpass_bookings").select("id")\
       .eq("slot_id", slot_id).limit(1).execute()
     if existente_slot.data:
@@ -81,9 +138,11 @@ async def totalpass_booking_webhook(request: Request):
     place_api_key = get_place_api_key(clase["sucursal_id"]) if clase.get("sucursal_id") \
       else os.getenv("TOTALPASS_PLACE_API_KEY")
 
-    # Buscar / crear cliente
-    cliente_res = supabase.table("clientes").select("id").eq("email", email).limit(1).execute()
-    cliente_id  = cliente_res.data[0]["id"] if cliente_res.data else None
+    # Buscar / crear cliente (sin importar mayúsculas)
+    cliente_id = None
+    if email:
+      cliente_res = supabase.table("clientes").select("id").ilike("email", email).limit(1).execute()
+      cliente_id  = cliente_res.data[0]["id"] if cliente_res.data else None
 
     if not cliente_id and email:
       try:
@@ -101,16 +160,14 @@ async def totalpass_booking_webhook(request: Request):
       except Exception as e:
         print(f"Error creando cliente TotalPass: {e}")
 
-    # Anti-duplicado por cliente + clase
+    # Si ya tiene una reserva activa en esta clase, se reutiliza y se CONFIRMA la nueva solicitud
+    # (antes se ignoraba y TotalPass la rechazaba aunque hubiera lugar)
+    reserva_existente = None
     if cliente_id:
-      existente = supabase.table("reservas").select("id")\
-        .eq("cliente_id", cliente_id)\
-        .eq("clase_id", clase["id"])\
-        .neq("estatus", "Cancelada")\
-        .limit(1).execute()
-      if existente.data:
-        print("Reserva duplicada ignorada:", cliente_id, clase["id"])
-        return { "received": True, "duplicado": True }
+      ex = supabase.table("reservas").select("id")\
+        .eq("cliente_id", cliente_id).eq("clase_id", clase["id"])\
+        .neq("estatus", "Cancelada").limit(1).execute()
+      reserva_existente = ex.data[0]["id"] if ex.data else None
 
     supabase.table("totalpass_bookings").insert({
       "slot_id":         slot_id,
@@ -121,36 +178,38 @@ async def totalpass_booking_webhook(request: Request):
       "clase_id":        clase["id"],
       "sucursal_id":     clase.get("sucursal_id"),
       "estatus":         "Pendiente",
+      "reserva_id":      reserva_existente,
       "metadata":        body,
     }).execute()
 
     token = await get_booking_token(place_api_key)
 
-    # Cupo real = reservas activas en la BD (no el contador guardado)
     activas_res = supabase.table("reservas").select("id", count="exact")\
       .eq("clase_id", clase["id"]).neq("estatus", "Cancelada").execute()
     activas  = activas_res.count or 0
-    hay_cupo = activas < (clase.get("capacidad_max") or 999)
+    hay_cupo = bool(reserva_existente) or activas < (clase.get("capacidad_max") or 999)
 
     if hay_cupo:
-      try:
-        supabase.table("reservas").insert({
-          "clase_id":       clase["id"],
-          "cliente_id":     cliente_id,
-          "estatus":        "Confirmada",
-          "origen":         "TotalPass",
-          "nombre_externo": None,
-          "email_externo":  None,
-        }).execute()
-      except Exception as e:
-        print(f"Error insertando reserva TotalPass: {e}")
+      reserva_id = reserva_existente
+      if not reserva_id:
+        try:
+          ins = supabase.table("reservas").insert({
+            "clase_id":       clase["id"],
+            "cliente_id":     cliente_id,
+            "estatus":        "Confirmada",
+            "origen":         "TotalPass",
+            "nombre_externo": None if cliente_id else nombre,
+            "email_externo":  None if cliente_id else email,
+          }).execute()
+          reserva_id = ins.data[0]["id"] if ins.data else None
+        except Exception as e:
+          print(f"Error insertando reserva TotalPass: {e}")
 
-      # Supabase + Wellhub + TotalPass con el conteo real
       await sincronizar_cupos(clase["id"])
 
       try:
         await confirmar_slot(slot_id, token, "confirmed")
-        supabase.table("totalpass_bookings").update({ "estatus": "Confirmado" })\
+        supabase.table("totalpass_bookings").update({"estatus": "Confirmado", "reserva_id": reserva_id})\
           .eq("slot_id", slot_id).execute()
       except Exception as errConfirm:
         print("Error confirmando booking:", str(errConfirm))
