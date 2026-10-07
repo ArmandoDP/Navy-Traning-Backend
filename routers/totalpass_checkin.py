@@ -23,10 +23,11 @@ async def _validar(checkin: dict) -> dict:
   except Exception as e:
     ok, texto = False, str(e)
 
-  supabase.table("totalpass_checkins").update({
-    "estatus":   "Validado" if ok else "Rechazado",
-    "respuesta": texto,
-  }).eq("id", checkin["id"]).execute()
+    supabase.table("totalpass_checkins").update({
+        "estatus":   "Validado" if ok else "Rechazado",
+        "validado":  ok,
+        "respuesta": texto,
+    }).eq("id", checkin["id"]).execute()
 
   if ok:
     print(f"✅ Check-in TotalPass validado: {checkin.get('email')}")
