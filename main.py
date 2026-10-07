@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import (
-  crons, pagos, totalpass, totalpass_booking, clientes, clases, wellhub,
+  crons, pagos, totalpass, totalpass_booking, clientes, clases, totalpass_checkin, wellhub,
   confirmar_reserva, sincronizacion, editar_clase, stripe_pagos,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -32,6 +32,7 @@ app.include_router(crons.router,             prefix="/crons")
 app.include_router(pagos.router,             prefix="/pagos")              # OrkestaPay (apagado)
 app.include_router(totalpass.router,         prefix="/totalpass")
 app.include_router(totalpass_booking.router, prefix="/totalpass-booking")
+app.include_router(totalpass_checkin.router, prefix="/totalpass-checkin")
 app.include_router(clientes.router,          prefix="/clientes")
 app.include_router(clases.router,            prefix="/clases")
 app.include_router(editar_clase.router,      prefix="/clases")             # /clases/actualizar

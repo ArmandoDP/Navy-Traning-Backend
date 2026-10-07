@@ -45,7 +45,7 @@ async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "re
       return {}
 
 
-VENTANA_CANCELACION_MIN = 60   # cancelar con menos de esto = cancelación tardía (solo genera alerta)
+VENTANA_CANCELACION_MIN = int(os.getenv("CANCELACION_MIN", "720"))   # 12 h: cancelar después = cancelación tardía (alerta)
 
 
 async def _cancelar_booking_totalpass(slot_id: str, body: dict):
@@ -294,6 +294,8 @@ async def publicar_clase_totalpass(req: dict):
     dt_cdmx = dt_utc - timedelta(hours=6)
     event_date = dt_cdmx.strftime("%Y-%m-%d")
     start_time = dt_cdmx.strftime("%I:%M %p")
+    # Después de esta hora, TotalPass cuenta la cancelación como tardía
+    max_cancel = (dt_cdmx - timedelta(minutes=VENTANA_CANCELACION_MIN)).strftime("%Y-%m-%d %I:%M %p")
 
     # Slots para TotalPass = capacidad - reservas que ya existan de otros canales
     reservas_res = supabase.table("reservas").select("origen")\
@@ -322,6 +324,7 @@ async def publicar_clase_totalpass(req: dict):
           "timezone":    "es-MX",
           "status":      "ACTIVE",
           "description": descripcion or nombre,
+          **({"maxTimeToCancel": max_cancel} if dt_utc - timedelta(minutes=VENTANA_CANCELACION_MIN) > datetime.now(dt_utc.tzinfo) else {}),
         }
       )
       print("TotalPass publicar clase:", res.status_code, res.text[:300])
