@@ -1,6 +1,8 @@
 # routers/totalpass_checkin.py  →  prefijo /totalpass-checkin
 # TotalPass avisa cuando un usuario hace check-in en su app; nosotros validamos la visita.
 import os
+import asyncio
+from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi            import APIRouter, Request, HTTPException
 from services.supabase  import supabase
@@ -11,10 +13,32 @@ router = APIRouter()
 # on  → se valida en automático al llegar el aviso (como Wellhub)
 # off → queda Pendiente y recepción lo valida desde el CRM
 VALIDACION_AUTOMATICA = os.getenv("TOTALPASS_CHECKIN_AUTO", "on") == "on"
+TIPO_ALERTA_CHECKIN   = os.getenv("ALERTA_TIPO_CHECKIN", "pago_fallido")   # cambiar a "checkin_fallido" cuando exista
+
+
+def _ya_validado(checkin: dict) -> bool:
+  """TotalPass puede mandar el mismo check-in dos veces: ¿ya se validó con el otro aviso?"""
+  if not checkin.get("email") and not checkin.get("codigo_usuario"):
+    return False
+  desde = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+  q = supabase.table("totalpass_checkins").select("id").eq("estatus", "Validado")\
+    .gte("created_at", desde).neq("id", checkin["id"])
+  q = q.eq("codigo_usuario", checkin["codigo_usuario"]) if checkin.get("codigo_usuario") else q.ilike("email", checkin["email"])
+  return bool(q.limit(1).execute().data)
+
+
+def _marcar_duplicado(checkin: dict):
+  supabase.table("totalpass_checkins").update({
+    "estatus": "Validado", "validado": True, "respuesta": "Aviso repetido: la visita ya estaba validada",
+  }).eq("id", checkin["id"]).execute()
 
 
 async def _validar(checkin: dict) -> dict:
   """Llama a la URL de confirmación que mandó TotalPass."""
+  if _ya_validado(checkin):
+    _marcar_duplicado(checkin)
+    return {"validado": True, "duplicado": True}
+
   try:
     async with httpx.AsyncClient(timeout=15.0) as client:
       r = await client.post(checkin["endpoint"])
@@ -23,18 +47,25 @@ async def _validar(checkin: dict) -> dict:
   except Exception as e:
     ok, texto = False, str(e)
 
-    supabase.table("totalpass_checkins").update({
-        "estatus":   "Validado" if ok else "Rechazado",
-        "validado":  ok,
-        "respuesta": texto,
-    }).eq("id", checkin["id"]).execute()
+  supabase.table("totalpass_checkins").update({
+    "estatus":   "Validado" if ok else "Rechazado",
+    "validado":  ok,
+    "respuesta": texto,
+  }).eq("id", checkin["id"]).execute()
+
+  # Los dos avisos llegan casi al mismo tiempo: si el otro sí validó, este no es error
+  if not ok:
+    await asyncio.sleep(1.5)
+    if _ya_validado(checkin):
+      _marcar_duplicado(checkin)
+      return {"validado": True, "duplicado": True}
 
   if ok:
     print(f"✅ Check-in TotalPass validado: {checkin.get('email')}")
   else:
     print(f"❌ Check-in TotalPass no validado: {checkin.get('email')} → {texto}")
     supabase.table("alertas").insert({
-      "tipo":        "pago_fallido",
+      "tipo":        TIPO_ALERTA_CHECKIN,
       "categoria":   "operacion",
       "titulo":      f"Check-in TotalPass no validado — {checkin.get('nombre') or checkin.get('email') or ''}".strip(),
       "descripcion": texto,
