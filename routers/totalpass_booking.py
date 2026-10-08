@@ -89,24 +89,7 @@ async def _cancelar_booking_totalpass(slot_id: str, body: dict):
 
   await sincronizar_cupos(b["clase_id"])
 
-  # Alerta si canceló muy cerca de la clase
-  try:
-    from datetime import datetime, timezone
-    cl = supabase.table("clases").select("nombre_clase, horario").eq("id", b["clase_id"]).limit(1).execute()
-    if cl.data:
-      inicio = datetime.fromisoformat(cl.data[0]["horario"].replace("Z", "+00:00"))
-      minutos = (inicio - datetime.now(timezone.utc)).total_seconds() / 60
-      if minutos < VENTANA_CANCELACION_MIN:
-        supabase.table("alertas").insert({
-          "tipo":        "no_show",
-          "categoria":   "asistencia",
-          "titulo":      "Cancelación tardía — TotalPass",
-          "descripcion": f"{b.get('email') or 'Usuario'} canceló {cl.data[0]['nombre_clase']} {int(max(minutos, 0))} min antes",
-          "cliente_id":  b.get("cliente_id"),
-          "metadata":    {"slot_id": slot_id},
-        }).execute()
-  except Exception as e:
-    print("Error alerta cancelación tardía:", e)
+  # La alerta de cancelación (a tiempo / tardía) la crea la base de datos al cancelar la reserva
 
   print(f"🔓 TotalPass cancelado: slot {slot_id} → lugar liberado")
   return {"received": True, "cancelado": True}

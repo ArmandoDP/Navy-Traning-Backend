@@ -13,7 +13,17 @@ router = APIRouter()
 # on  → se valida en automático al llegar el aviso (como Wellhub)
 # off → queda Pendiente y recepción lo valida desde el CRM
 VALIDACION_AUTOMATICA = os.getenv("TOTALPASS_CHECKIN_AUTO", "on") == "on"
-TIPO_ALERTA_CHECKIN   = os.getenv("ALERTA_TIPO_CHECKIN", "pago_fallido")   # cambiar a "checkin_fallido" cuando exista
+MOTIVOS = {
+  "check_in_expired_alert": "El check-in expiró: pasaron más de 1.5 horas desde que lo hizo en TotalPass.",
+  "check_in_not_available": "TotalPass dice que ese check-in ya no está disponible (lo canceló o ya se había usado).",
+}
+
+
+def _motivo(texto: str) -> str:
+  for clave, msg in MOTIVOS.items():
+    if clave in (texto or ""):
+      return msg
+  return f"TotalPass respondió: {(texto or 'sin respuesta')[:160]}"
 
 
 def _ya_validado(checkin: dict) -> bool:
@@ -60,18 +70,23 @@ async def _validar(checkin: dict) -> dict:
       _marcar_duplicado(checkin)
       return {"validado": True, "duplicado": True}
 
+  quien = checkin.get("nombre") or checkin.get("email") or "Usuario"
   if ok:
     print(f"✅ Check-in TotalPass validado: {checkin.get('email')}")
   else:
     print(f"❌ Check-in TotalPass no validado: {checkin.get('email')} → {texto}")
+  try:
     supabase.table("alertas").insert({
-      "tipo":        TIPO_ALERTA_CHECKIN,
-      "categoria":   "operacion",
-      "titulo":      f"Check-in TotalPass no validado — {checkin.get('nombre') or checkin.get('email') or ''}".strip(),
-      "descripcion": texto,
+      "tipo":        "checkin_ok" if ok else "checkin_fallido",
+      "categoria":   "plataformas",
+      "titulo":      f"Check-in TotalPass {'validado' if ok else 'no validado'} — {quien}",
+      "descripcion": (f"Llegó a {checkin.get('place_nombre') or 'Navy'} · visita validada, TotalPass la paga"
+                      if ok else _motivo(texto)),
       "cliente_id":  checkin.get("cliente_id"),
-      "metadata":    {"checkin_id": checkin["id"]},
+      "metadata":    {"checkin_id": checkin["id"], "canal": "TotalPass"},
     }).execute()
+  except Exception as e:
+    print("Error alerta check-in:", e)
   return {"validado": ok, "respuesta": texto}
 
 
