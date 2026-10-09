@@ -185,9 +185,12 @@ def _sesion_pago(base: dict, msi: bool = True):
 
 
 def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str) -> dict:
-  paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus", id=paquete_id)
+  paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus, visible_en_app", id=paquete_id)
   if not paq or (paq.get("estatus") and paq["estatus"] != "Activo"):
     raise ValueError("Este paquete no está disponible")
+  # Oculto en la app: solo se vende con link de pago o en sucursal
+  if origen == "app" and paq.get("visible_en_app") is False:
+    raise ValueError("Este paquete no está disponible en la app")
   cli = _uno("clientes", "id, sucursal_id", id=cliente_id)
   if not cli:
     raise ValueError("Cliente no encontrado")
@@ -328,9 +331,12 @@ def _trial_end(memb) -> int | None:
 
 
 def _preparar_compra(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str) -> dict:
-  paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus", id=paquete_id)
+  paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus, visible_en_app", id=paquete_id)
   if not paq or (paq.get("estatus") and paq["estatus"] != "Activo"):
     raise ValueError("Este paquete no está disponible")
+  # Oculto en la app: solo se vende con link de pago o en sucursal
+  if origen == "app" and paq.get("visible_en_app") is False:
+    raise ValueError("Este paquete no está disponible en la app")
   cli = _uno("clientes", "id, sucursal_id", id=cliente_id)
   if not cli:
     raise ValueError("Cliente no encontrado")
