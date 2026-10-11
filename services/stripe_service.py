@@ -184,7 +184,8 @@ def _sesion_pago(base: dict, msi: bool = True):
   raise ultimo
 
 
-def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str) -> dict:
+def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str,
+                     extra_meta: dict | None = None) -> dict:
   paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus, visible_en_app", id=paquete_id)
   if not paq or (paq.get("estatus") and paq["estatus"] != "Activo"):
     raise ValueError("Este paquete no está disponible")
@@ -206,7 +207,7 @@ def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, 
 
   customer = get_or_create_customer(cliente_id)
   meta = _meta({"tipo": "paquete", "cliente_id": cliente_id, "paquete_id": paquete_id,
-                "sucursal_id": suc, "origen": origen, "monto": monto})
+                "sucursal_id": suc, "origen": origen, "monto": monto, **(extra_meta or {})})
   ok_url, cancel_url = _urls(origen)
   producto = {"currency": "mxn", "unit_amount": centavos(monto),
               "product_data": {"name": paq["nombre"], "metadata": {"paquete_id": paquete_id}}}
@@ -463,7 +464,8 @@ def crear_link_pago(paquete_id: str, sucursal_id: str, staff_id: str | None) -> 
   if rec:
     kw["subscription_data"] = {"metadata": meta, "description": desc}
   else:
-    kw["payment_intent_data"] = {"metadata": meta, "description": desc}
+    # La tarjeta queda guardada para renovaciones, The Galley y No Shows
+    kw["payment_intent_data"] = {"metadata": meta, "description": desc, "setup_future_usage": "off_session"}
     kw["customer_creation"] = "always"
   link = stripe.PaymentLink.create(**kw)
 

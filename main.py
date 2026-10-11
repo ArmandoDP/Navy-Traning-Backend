@@ -2,8 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import (
-  crons, pagos, soporte, totalpass, totalpass_booking, totalpass_checkin, clientes, clases, wellhub,
-  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias,
+  crons, pagos, totalpass, totalpass_booking, totalpass_checkin, clientes, clases, wellhub,
+  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
@@ -40,12 +40,13 @@ app.include_router(totalpass_booking.router, prefix="/totalpass-booking")
 app.include_router(totalpass_checkin.router, prefix="/totalpass-checkin")
 app.include_router(clientes.router,          prefix="/clientes")
 app.include_router(clases.router,            prefix="/clases")
-app.include_router(soporte.router, prefix="/soporte")
 app.include_router(editar_clase.router,      prefix="/clases")             # /clases/actualizar
 app.include_router(wellhub.router,           prefix="/wellhub")
 app.include_router(sincronizacion.router,    prefix="/sync")               # /sync/cupos
 app.include_router(stripe_pagos.router,      prefix="/stripe")             # pagos con Stripe
 app.include_router(membresias.router,        prefix="/membresias")         # fechas de membresías
+app.include_router(soporte.router,           prefix="/soporte")            # diagnóstico de clientes
+app.include_router(cobros.router,            prefix="/cobros")             # cobrar sin terminal
 app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler (horas en UTC: CDMX = UTC-6)

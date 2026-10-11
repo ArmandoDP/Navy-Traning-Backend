@@ -357,6 +357,12 @@ async def _procesar(event):
     if s.get("payment_link") and not meta.get("cliente_id"):
       meta = await _meta_desde_link(s, contar_uso=(tipo == "checkout.session.completed"))
 
+    # Cobro enviado desde recepción: queda como pagado (recepción lo ve en vivo)
+    if meta.get("solicitud_id") and s.payment_status in ("paid", "no_payment_required") \
+       and tipo in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+      from routers.cobros import marcar_solicitud_pagada
+      marcar_solicitud_pagada(meta["solicitud_id"])
+
     if s.mode == "setup":
       if tipo == "checkout.session.completed":
         await _tarjeta_agregada(s, meta)
