@@ -196,6 +196,8 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
       {"tipo": "pago_confirmado"})
 
   print(f"💳 Paquete activado: {cliente.get('email')} | {paquete['nombre']} | {inicio} → {fin} | {metodo}")
+  from services.estado_clientes import sincronizar_cliente
+  sincronizar_cliente(cliente_id)   # plan, vencimiento y estado en su ficha
   return {"ok": True, "inicio": inicio.isoformat(), "fin": fin.isoformat()}
 
 

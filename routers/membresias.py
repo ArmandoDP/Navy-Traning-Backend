@@ -15,7 +15,7 @@ async def editar_fechas(request: Request):
   staff = staff_de_sesion(request, roles=["direccion"])
   b = await request.json()
   r = supabase.table("membresias")\
-    .select("id, cliente_id, fecha_inicio, fecha_fin, activacion_pendiente, stripe_subscription_id, "
+    .select("id, cliente_id, fecha_inicio, fecha_fin, fecha_compra, activacion_pendiente, stripe_subscription_id, "
             "paquetes(nombre, vigencia_dias), clientes(nombre_completo, sucursal_id)")\
     .eq("id", b.get("membresia_id")).limit(1).execute()
   if not r.data:
@@ -26,6 +26,11 @@ async def editar_fechas(request: Request):
 
   if b.get("activacion_pendiente") is True:
     nuevo_inicio, nuevo_fin, pendiente = hoy, hoy + timedelta(days=vig + DIAS_MAX_ACTIVACION), True
+    # Nunca recortar: si ya vence después de lo que tendría al activarse, ponerla en espera le quitaría tiempo
+    if not m.get("activacion_pendiente") and date.fromisoformat(m["fecha_fin"]) > hoy + timedelta(days=vig + DIAS_MAX_ACTIVACION):
+      raise HTTPException(status_code=400, detail=(
+        f"Esta membresía vence el {date.fromisoformat(m['fecha_fin']):%d/%m/%Y}. Ponerla en espera la recortaría, "
+        f"porque al activarse solo tendría {vig} días. Si quieres cambiarla, edita las fechas directamente."))
   else:
     try:
       nuevo_inicio = date.fromisoformat(b.get("fecha_inicio") or m["fecha_inicio"])
@@ -40,6 +45,8 @@ async def editar_fechas(request: Request):
   delta = (nuevo_fin - fin_anterior).days
 
   upd = {"fecha_inicio": nuevo_inicio.isoformat(), "fecha_fin": nuevo_fin.isoformat(), "activacion_pendiente": pendiente}
+  if pendiente and not m.get("fecha_compra"):
+    upd["fecha_compra"] = hoy.isoformat()   # sin esto no le llegan recordatorios ni se activa sola
   if not pendiente and m.get("activacion_pendiente"):
     upd["activada_at"] = datetime.now(timezone.utc).isoformat()
   if m.get("stripe_subscription_id") and delta != 0:
@@ -57,11 +64,8 @@ async def editar_fechas(request: Request):
         "fecha_fin":    (date.fromisoformat(q["fecha_fin"]) + timedelta(days=delta)).isoformat(),
       }).eq("id", q["id"]).execute()
 
-  activas = supabase.table("membresias").select("fecha_fin")\
-    .eq("cliente_id", m["cliente_id"]).eq("estatus", "Activa").execute().data or []
-  if activas:
-    supabase.table("clientes").update({"fecha_venc_plan": max(a["fecha_fin"] for a in activas)})\
-      .eq("id", m["cliente_id"]).execute()
+  from services.estado_clientes import sincronizar_cliente
+  sincronizar_cliente(m["cliente_id"])   # plan, vencimiento y estado en su ficha
 
   quien   = " ".join(f"{staff.get('nombre') or ''} {staff.get('primer_apellido') or ''}".split())
   cliente = (m.get("clientes") or {}).get("nombre_completo", "")

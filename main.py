@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import (
   crons, pagos, totalpass, totalpass_booking, totalpass_checkin, clientes, clases, wellhub,
-  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros,
+  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
@@ -12,6 +12,7 @@ from services.push import (
   check_no_shows,
   check_clases_en_curso,
 )
+from services.estado_clientes import sincronizar_todos as sincronizar_estado_clientes
 from services.membresias_pendientes import (
   sincronizar_stripe_membresias,
   activar_membresias_por_tiempo,
@@ -47,6 +48,7 @@ app.include_router(stripe_pagos.router,      prefix="/stripe")             # pag
 app.include_router(membresias.router,        prefix="/membresias")         # fechas de membresías
 app.include_router(soporte.router,           prefix="/soporte")            # diagnóstico de clientes
 app.include_router(cobros.router,            prefix="/cobros")             # cobrar sin terminal
+app.include_router(estado_clientes.router,   prefix="/clientes-estado")    # plan y estado de clientes
 app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler (horas en UTC: CDMX = UTC-6)
@@ -61,6 +63,7 @@ async def startup():
   scheduler.add_job(sincronizar_stripe_membresias, 'interval', minutes=10)
   scheduler.add_job(activar_membresias_por_tiempo, 'cron', hour=6,  minute=10)   # 00:10 CDMX
   scheduler.add_job(invitar_a_reservar,            'cron', hour=16, minute=0)    # 10:00 CDMX
+  scheduler.add_job(sincronizar_estado_clientes,   'cron', minute=5)              # cada hora (incluye 00:05 CDMX)
   scheduler.start()
 
 @app.on_event("shutdown")
