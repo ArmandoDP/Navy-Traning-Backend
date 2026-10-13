@@ -252,3 +252,32 @@ def marcar_solicitud_pagada(solicitud_id: str):
   supabase.table("solicitudes_pago").update({
     "estatus": "Pagada", "pagada_en": datetime.now(timezone.utc).isoformat(),
   }).eq("id", solicitud_id).in_("estatus", ["Pendiente", "Expirada"]).execute()
+
+
+# ─── Cancelar o reactivar la renovación automática (también en Stripe) ──────
+@router.post("/renovacion/{membresia_id}")
+async def renovacion(membresia_id: str, request: Request):
+  staff = staff_de_sesion(request, roles=["direccion"])
+  b = await request.json()
+  cancelar = bool(b.get("cancelar"))
+  memb = _uno("membresias", "id, cliente_id, fecha_fin, stripe_subscription_id, paquetes(nombre)", id=membresia_id)
+  if not memb:
+    raise HTTPException(status_code=404, detail="Membresía no encontrada")
+
+  en_stripe = False
+  sub_id = memb.get("stripe_subscription_id")
+  if sub_id:
+    try:
+      # cancel_at_period_end: no se cancela de golpe; deja de cobrar al terminar el periodo pagado
+      stripe.Subscription.modify(sub_id, cancel_at_period_end=cancelar)
+      en_stripe = True
+    except stripe.error.InvalidRequestError as e:
+      print(f"renovación {sub_id}:", e.user_message or e)
+  supabase.table("membresias").update({"renovacion_cancelada": cancelar}).eq("id", membresia_id).execute()
+
+  cli = _uno("clientes", "id, nombre_completo, email, sucursal_id", id=memb["cliente_id"]) or {"id": memb["cliente_id"]}
+  plan = (memb.get("paquetes") or {}).get("nombre", "")
+  _log(staff, cli, "renovacion_cancelada" if cancelar else "renovacion_reactivada",
+       f"{'canceló' if cancelar else 'reactivó'} la renovación automática de {plan}",
+       {"membresia_id": membresia_id, "suscripcion": sub_id, "en_stripe": en_stripe})
+  return {"ok": True, "cancelada": cancelar, "en_stripe": en_stripe}
