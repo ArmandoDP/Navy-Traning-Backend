@@ -155,9 +155,11 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     "metadata":                   {"origen": origen, "paquete_id": paquete_id, "subscription_id": subscription_id},
   }
   if pago_previo:  # OXXO que ya estaba pendiente
-    supabase.table("pagos").update(pago).eq("id", pago_previo["id"]).execute()
+    fila_pago = supabase.table("pagos").update(pago).eq("id", pago_previo["id"]).execute().data
   else:
-    supabase.table("pagos").insert(pago).execute()
+    fila_pago = supabase.table("pagos").insert(pago).execute().data
+  fila_pago = (fila_pago or [{}])[0]
+  pago_id = fila_pago.get("id")
 
   supabase.table("membresias").insert({
     "cliente_id":             cliente_id,
@@ -177,7 +179,7 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     upd["stripe_subscription_id"] = subscription_id
   supabase.table("clientes").update(upd).eq("id", cliente_id).execute()
 
-  folio = (invoice_id or payment_intent_id or session_id or "")[-12:].upper()
+  folio = fila_pago.get("folio") or (invoice_id or payment_intent_id or session_id or "")[-12:].upper()
   await comprobante_paquete(cliente, paquete, inicio.isoformat(), fin.isoformat(),
                             monto, folio, metodo, nombre_sucursal(sucursal_id), tenia)
 
@@ -185,19 +187,21 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
   if es_renovacion:
     await push_cliente(cliente_id, "✅ Membresía renovada",
       f"Tu plan {paquete['nombre']} se renovó. Vigente hasta el {fin.strftime('%d/%m/%Y')}.",
-      {"tipo": "renovacion_exitosa"})
+      {"tipo": "renovacion_exitosa", "pago_id": pago_id})
   elif inicio > hoy:
     await push_cliente(cliente_id, "🎉 ¡Pago confirmado!",
       f"{nombre1}, tu {paquete['nombre']} arranca el {inicio.strftime('%d/%m/%Y')}, cuando termine tu plan actual.",
-      {"tipo": "pago_confirmado"})
+      {"tipo": "pago_confirmado", "pago_id": pago_id})
   else:
     await push_cliente(cliente_id, "🎉 ¡Pago confirmado!",
       f"{nombre1}, tu {paquete['nombre']} ya está activo. ¡A entrenar!",
-      {"tipo": "pago_confirmado"})
+      {"tipo": "pago_confirmado", "pago_id": pago_id})
 
   print(f"💳 Paquete activado: {cliente.get('email')} | {paquete['nombre']} | {inicio} → {fin} | {metodo}")
   from services.estado_clientes import sincronizar_cliente
   sincronizar_cliente(cliente_id)   # plan, vencimiento y estado en su ficha
+  from services.tarjetas import actualizar_tarjeta
+  actualizar_tarjeta(cliente_id)    # la tarjeta con la que pagó queda en su ficha
   return {"ok": True, "inicio": inicio.isoformat(), "fin": fin.isoformat()}
 
 

@@ -194,7 +194,7 @@ async def cobrar_tarjeta(request: Request):
     {"tipo": "cargo_directo", "cliente_id": cliente_id, "staff_id": staff.get("id"),
      "venta_id": b.get("venta_id"), "concepto": concepto})
 
-  supabase.table("pagos").insert({
+  fila_pago = supabase.table("pagos").insert({
     "cliente_id":               cliente_id,
     "sucursal_id":              sucursal_id,
     "monto":                    monto,
@@ -207,7 +207,8 @@ async def cobrar_tarjeta(request: Request):
     "receipt_url":              res.get("receipt_url"),
     "comision":                 res.get("comision"),
     "metadata":                 {"venta_id": b.get("venta_id"), "staff_id": staff.get("id")},
-  }).execute()
+  }).execute().data
+  fila_pago = (fila_pago or [{}])[0]
 
   quien = " ".join(f"{staff.get('nombre') or ''} {staff.get('primer_apellido') or ''}".split())
   supabase.table("actividad_log").insert({
@@ -227,13 +228,13 @@ async def cobrar_tarjeta(request: Request):
   try:
     await enviar_comprobante_compra(
       email=cli.get("email"), nombre=cli.get("nombre_completo"), monto=monto,
-      metodo_pago=res.get("metodo"), folio=(res.get("payment_intent_id") or "")[-12:].upper(), concepto=concepto,
+      metodo_pago=res.get("metodo"), folio=fila_pago.get("folio") or (res.get("payment_intent_id") or "")[-12:].upper(), concepto=concepto,
     )
   except Exception as e:
     print("Error comprobante cargo directo:", e)
   await push_cliente(cliente_id, "🧾 Compra registrada",
     f"Se cobraron ${monto:,.2f} a tu {res.get('metodo')} por {concepto}. Te enviamos tu comprobante.",
-    {"tipo": "cargo_tarjeta"})
+    {"tipo": "cargo_tarjeta", "pago_id": fila_pago.get("id")})
   return {"ok": True, "metodo": res.get("metodo"), "receipt_url": res.get("receipt_url")}
 
 
@@ -445,6 +446,8 @@ async def _tarjeta_agregada(s, meta):
   if si.payment_method:
     stripe.Customer.modify(s.customer, invoice_settings={"default_payment_method": si.payment_method})
   if meta.get("cliente_id"):
+    from services.tarjetas import actualizar_tarjeta
+    actualizar_tarjeta(meta["cliente_id"])
     await push_cliente(meta["cliente_id"], "💳 Tarjeta agregada",
       "Quedó como tu tarjeta principal para renovaciones y compras.", {"tipo": "tarjeta_agregada"})
 
@@ -573,6 +576,8 @@ async def _setup_exitoso(si):
   stripe.Customer.modify(si.customer, invoice_settings={"default_payment_method": si.payment_method})
 
   if meta.get("tipo") == "setup":
+    from services.tarjetas import actualizar_tarjeta
+    actualizar_tarjeta(cliente_id)
     await push_cliente(cliente_id, "💳 Tarjeta agregada",
       "Quedó como tu tarjeta principal para renovaciones y compras.", {"tipo": "tarjeta_agregada"})
     return

@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import (
   crons, pagos, totalpass, totalpass_booking, totalpass_checkin, clientes, clases, wellhub,
-  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes, metas, lista_espera,
+  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes, metas, lista_espera, mis_pagos,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
@@ -15,6 +15,7 @@ from services.push import (
 from services.estado_clientes import sincronizar_todos as sincronizar_estado_clientes
 from services.metas import evaluar_todas as evaluar_metas, recordatorio_noche as recordatorio_metas
 from services.lista_espera import procesar_eventos as avisos_lista_espera, cerrar_listas as cerrar_listas_espera
+from services.tarjetas import recordatorio_tarjeta
 from services.membresias_pendientes import (
   sincronizar_stripe_membresias,
   activar_membresias_por_tiempo,
@@ -53,6 +54,7 @@ app.include_router(cobros.router,            prefix="/cobros")             # cob
 app.include_router(estado_clientes.router,   prefix="/clientes-estado")    # plan y estado de clientes
 app.include_router(metas.router,             prefix="/metas")              # metas de entrenamiento
 app.include_router(lista_espera.router,      prefix="/lista-espera")       # lista de espera de clases
+app.include_router(mis_pagos.router,         prefix="/mis-pagos")          # historial, detalle, PDF y tarjeta
 app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler (horas en UTC: CDMX = UTC-6)
@@ -72,6 +74,7 @@ async def startup():
   scheduler.add_job(recordatorio_metas,            'cron', hour=2, minute=0)       # 20:00 CDMX
   scheduler.add_job(avisos_lista_espera,           'interval', seconds=30)         # avisos de lista de espera
   scheduler.add_job(cerrar_listas_espera,          'interval', minutes=5)          # cierre de la asignación automática
+  scheduler.add_job(recordatorio_tarjeta,          'cron', hour=17, minute=0)     # 11:00 CDMX: tarjeta antes de que venza el plan
   scheduler.start()
 
 @app.on_event("shutdown")
