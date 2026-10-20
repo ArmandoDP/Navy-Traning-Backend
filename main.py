@@ -71,7 +71,7 @@ async def startup():
   scheduler.add_job(evaluar_metas,                 'cron', minute='*/15')          # check-ins, días y semanas
   scheduler.add_job(recordatorio_metas,            'cron', hour=2, minute=0)       # 20:00 CDMX
   scheduler.add_job(avisos_lista_espera,           'interval', seconds=30)         # avisos de lista de espera
-  scheduler.add_job(cerrar_listas_espera,          'interval', minutes=5)          # cierre 12 h antes
+  scheduler.add_job(cerrar_listas_espera,          'interval', minutes=5)          # cierre de la asignación automática
   scheduler.start()
 
 @app.on_event("shutdown")

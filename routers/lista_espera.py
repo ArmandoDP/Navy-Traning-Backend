@@ -19,7 +19,7 @@ def _clase(clase_id: str) -> dict:
 
 
 def _cierre(clase: dict) -> datetime:
-  return datetime.fromisoformat(clase["horario"].replace("Z", "+00:00")) - timedelta(hours=12)
+  return L.cierre(clase["horario"])
 
 
 def _validar(cliente_id: str, clase: dict, modo: str):
@@ -28,7 +28,7 @@ def _validar(cliente_id: str, clase: dict, modo: str):
   if clase.get("estado") not in (None, "Activa"):
     raise HTTPException(status_code=400, detail="Esta clase ya no está activa.")
   if modo == "Remota" and ahora >= _cierre(clase):
-    raise HTTPException(status_code=400, detail="La lista de espera de esta clase ya cerró (12 horas antes). Si se libera un lugar, podrás reservarlo normal.")
+    raise HTTPException(status_code=400, detail="Ya no se asignan lugares para esta clase. Si quieres intentarlo, ve a la sucursal: si alguien no llega, recepción te da su lugar.")
   if L.libres(clase) > 0:
     raise HTTPException(status_code=400, detail="Todavía hay lugares: puedes reservar directamente.")
   ya = supabase.table("reservas").select("id").eq("cliente_id", cliente_id).eq("clase_id", clase["id"])\
