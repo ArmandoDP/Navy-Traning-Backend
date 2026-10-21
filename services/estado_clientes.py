@@ -60,7 +60,9 @@ def calcular(cliente: dict, membresias: list[dict], hoy: str | None = None) -> d
       "fecha_venc_plan": ult["fecha_fin"],
       "estatus":         estatus if (estatus == "Inactivo" or cliente.get("perdido")) else "Vencido",
     }
-  return {}
+  # Ningún plan (por ejemplo, se le cancelaron todos): la ficha queda limpia
+  return {"plan": None, "paquete_id": None, "fecha_venc_plan": None,
+          "estatus": cliente.get("estatus") if cliente.get("estatus") in ("Inactivo", "Prospecto") else "Inactivo"}
 
 
 def _neg_fecha(f: str | None) -> int:
@@ -72,14 +74,16 @@ def _neg_fecha(f: str | None) -> int:
 
 def _cambios(cliente: dict, nuevo: dict) -> dict:
   cambios = {k: v for k, v in nuevo.items() if (cliente.get(k) or None) != (v or None)}
-  # La columna vieja que todavía leen algunas pantallas
+  # Columnas viejas que todavía leen algunas pantallas: siempre iguales a las nuevas
+  if "plan" in nuevo and (cliente.get("nombre_plan") or None) != (nuevo["plan"] or None):
+    cambios["nombre_plan"] = nuevo["plan"]
   if "fecha_venc_plan" in cambios:
-    cambios["fecha_vencimiento_memb"] = cambios["fecha_venc_plan"]
+    cambios["fecha_vencimiento_membresia"] = cambios["fecha_venc_plan"]
   return cambios
 
 
 SEL_MEMB = "cliente_id, estatus, fecha_inicio, fecha_fin, activacion_pendiente, origen, precio_pagado, paquete_id, paquetes(nombre)"
-SEL_CLI  = "id, origen, estatus, plan, paquete_id, fecha_venc_plan, perdido"
+SEL_CLI  = "id, origen, estatus, plan, nombre_plan, paquete_id, fecha_venc_plan, perdido"
 
 
 def sincronizar_cliente(cliente_id: str) -> dict:
