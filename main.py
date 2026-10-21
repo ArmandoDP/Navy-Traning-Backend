@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import (
   crons, pagos, totalpass, totalpass_booking, totalpass_checkin, clientes, clases, wellhub,
-  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes, metas, lista_espera, mis_pagos,
+  confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes, metas, lista_espera, mis_pagos, clientes_admin,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.push import (
@@ -55,6 +55,7 @@ app.include_router(estado_clientes.router,   prefix="/clientes-estado")    # pla
 app.include_router(metas.router,             prefix="/metas")              # metas de entrenamiento
 app.include_router(lista_espera.router,      prefix="/lista-espera")       # lista de espera de clases
 app.include_router(mis_pagos.router,         prefix="/mis-pagos")          # historial, detalle, PDF y tarjeta
+app.include_router(clientes_admin.router,    prefix="/clientes-admin")     # eliminar y unir clientes (dirección)
 app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler (horas en UTC: CDMX = UTC-6)
