@@ -1,12 +1,11 @@
 # services/metas.py — metas de entrenamiento (splits NAVY)
 #
-# Reglas:
-#  · La meta son N semanas cumplidas (8 por defecto). Cada semana: ir a la clase que toca en los días que eligió.
-#  · Un día cuenta como cumplido con su check-in en una clase del tipo que le tocaba ese día.
-#  · Si falla un día: si tiene escudo (y no usó uno esa semana) se protege; si no, SOLO esa semana se reinicia
-#    el lunes siguiente. Las semanas ya cumplidas nunca se pierden.
-#  · Si ese día no hay clase de su tipo en su sucursal, no cuenta como falla.
-#  · Escudos: 1 al empezar, +1 cada 2 semanas cumplidas seguidas, +1 por clase extra (1 por semana). Máximo 2.
+# Reglas (versión sencilla):
+#  · La meta dura N semanas de calendario (8 por defecto). Cada semana: ir a la clase que toca en los días que eligió.
+#  · Un día se cumple con su check-in en una clase del tipo que le tocaba ese día.
+#  · Una semana es "perfecta" si cumplió todos sus días. Al final se cuenta cuántas semanas perfectas logró.
+#  · No hay castigos: si un día no va, simplemente no se pinta. Si ese día no había su clase, no cuenta.
+#  · Solo con plan activo. Si se le vence el plan, la meta queda en pausa (sin penalizar) y sigue al renovar.
 from datetime import date, datetime, timedelta, timezone
 from services.supabase import supabase
 from services.stripe_activacion import push_cliente
@@ -84,6 +83,13 @@ def hizo_checkin(cliente_id: str, reserva: dict) -> bool:
   return bool(a)
 
 
+# ── Plan activo ───────────────────────────────────────────────────────────────
+def tiene_plan(cliente_id: str) -> bool:
+  r = supabase.table("membresias").select("id").eq("cliente_id", cliente_id).eq("estatus", "Activa")\
+    .or_(f"activacion_pendiente.eq.true,fecha_fin.gte.{hoy().isoformat()}").limit(1).execute().data
+  return bool(r)
+
+
 # ── Eventos (pop-ups en la app) y notificaciones ──────────────────────────────
 def evento(cm_id: str, tipo: str, datos: dict):
   supabase.table("meta_eventos").insert({"cliente_meta_id": cm_id, "tipo": tipo, "datos": datos}).execute()
@@ -92,12 +98,13 @@ def evento(cm_id: str, tipo: str, datos: dict):
 # ── Semana en curso ───────────────────────────────────────────────────────────
 def generar_semana(cm: dict, split: dict[int, str]):
   ini = date.fromisoformat(cm["semana_inicio"])
-  creada = datetime.fromisoformat(cm["created_at"].replace("Z", "+00:00")).astimezone(CDMX).date()
+  creada = date.fromisoformat(cm["cuenta_desde"]) if cm.get("cuenta_desde") else \
+           datetime.fromisoformat(cm["created_at"].replace("Z", "+00:00")).astimezone(CDMX).date()
   filas = []
   for d in sorted(cm["dias"]):
     f = ini + timedelta(days=d - 1)
     if f < creada:
-      continue                       # la primera semana empieza el día que eligió la meta
+      continue                       # cuenta desde que eligió la meta (o desde que la reanudó)
     filas.append({"cliente_meta_id": cm["id"], "fecha": f.isoformat(), "tipo_clase": split[d],
                   "semana_numero": cm["semana_numero"], "intento": cm["intento"]})
   if filas:
@@ -118,16 +125,29 @@ def _guardar_dia(d: dict, **cambios):
 
 
 async def evaluar(cm: dict) -> dict:
-  """Pone al día una meta activa: reservas, check-ins, días vencidos, semanas y escudos."""
+  """Pone al día una meta activa: reservas, check-ins y semanas."""
   meta = supabase.table("metas").select("*").eq("id", cm["meta_id"]).single().execute().data
-  split = {s["dia_semana"]: s["tipo_clase"] for s in
+  split = {x["dia_semana"]: x["tipo_clase"] for x in
            (supabase.table("meta_split").select("*").eq("meta_id", cm["meta_id"]).execute().data or [])}
   cli = supabase.table("clientes").select("id, sucursal_id, nombre_completo").eq("id", cm["cliente_id"]).single().execute().data
   cid, suc = cli["id"], cli.get("sucursal_id")
   h = hoy()
   orig = dict(cm)
 
-  for _ in range(12):                                   # por si el cron estuvo detenido varias semanas
+  # Sin plan activo: la meta queda en pausa
+  if not tiene_plan(cid):
+    if not cm.get("pausada"):
+      supabase.table("cliente_metas").update({"pausada": True}).eq("id", cm["id"]).execute()
+      cm["pausada"] = True
+    return cm
+  if cm.get("pausada"):
+    supabase.table("meta_dias").update({"estatus": "Anulado"}).eq("cliente_meta_id", cm["id"])\
+      .lt("fecha", h.isoformat()).in_("estatus", ["Pendiente", "Reservado"]).execute()
+    cm.update({"pausada": False, "cuenta_desde": h.isoformat()})
+    supabase.table("cliente_metas").update({"pausada": False, "cuenta_desde": h.isoformat()}).eq("id", cm["id"]).execute()
+    orig.update({"pausada": False, "cuenta_desde": h.isoformat()})
+
+  for _ in range(12):
     if cm["estatus"] != "Activa":
       break
     generar_semana(cm, split)
@@ -146,97 +166,51 @@ async def evaluar(cm: dict) -> dict:
         cm["racha"] += 1
         cm["mejor_racha"] = max(cm["mejor_racha"], cm["racha"])
         cl = r.get("clases") or {}
+        hechos = sum(1 for x in dias if x["estatus"] in ("Cumplido", "SinClase"))
         evento(cm["id"], "dia_cumplido", {"tipo": d["tipo_clase"], "clase": cl.get("nombre_clase"),
-               "hora": hora(cl["horario"]) if cl.get("horario") else None, "racha": cm["racha"],
+               "hora": hora(cl["horario"]) if cl.get("horario") else None, "hechos": hechos, "de": len(dias),
                "semana": cm["semana_numero"], "dia": DIAS[f.isoweekday()]})
-        await push_cliente(cid, "¡Día cumplido! 🔥",
-          f"{(cl.get('nombre_clase') or d['tipo_clase']).strip()} ✓ · racha de {cm['racha']}. Vas en la semana {cm['semana_numero']} de {meta['semanas']}.",
+        await push_cliente(cid, "¡Día cumplido!",
+          f"{(cl.get('nombre_clase') or d['tipo_clase']).strip()} ✓ · llevas {hechos} de {len(dias)} días esta semana.",
           {"tipo": "meta_dia_cumplido"})
       elif r and d["estatus"] == "Pendiente":
         _guardar_dia(d, estatus="Reservado", reserva_id=r["id"], clase_id=r["clase_id"])
       elif not r and d["estatus"] == "Reservado":
-        _guardar_dia(d, estatus="Pendiente", reserva_id=None, clase_id=None)   # canceló
+        _guardar_dia(d, estatus="Pendiente", reserva_id=None, clase_id=None)
 
-    # 2. Clase extra (en un día que no le tocaba): gana un escudo, una vez por semana
-    if cm.get("extra_semana") != ini.isoformat() and cm["escudos"] < MAX_ESCUDOS:
-      fechas_plan = {d["fecha"] for d in dias}
-      a_ini, _ = rango_utc(ini)
-      _, a_fin = rango_utc(min(h, fin))
-      asist = supabase.table("asistencias").select("fecha_checkin").eq("cliente_id", cid)\
-        .gte("fecha_checkin", a_ini).lt("fecha_checkin", a_fin).execute().data or []
-      extra = [a for a in asist if datetime.fromisoformat(a["fecha_checkin"].replace("Z", "+00:00"))
-               .astimezone(CDMX).date().isoformat() not in fechas_plan]
-      if extra:
-        cm["escudos"] += 1
-        cm["extra_semana"] = ini.isoformat()
-        evento(cm["id"], "escudo_ganado", {"razon": "clase_extra", "escudos": cm["escudos"]})
-        await push_cliente(cid, "🛡️ ¡Ganaste un escudo!", "Por ir a una clase extra esta semana. Te protege si un día no puedes ir.",
-                           {"tipo": "meta_escudo"})
-
-    # 3. Días que ya pasaron sin check-in
-    reiniciada = False
+    # 2. Días que ya pasaron: si no había su clase, no cuenta; si no fue, solo no se pinta
     for d in dias:
       f = date.fromisoformat(d["fecha"])
       if f >= h or d["estatus"] not in ("Pendiente", "Reservado"):
         continue
       if not clases_del_dia(f, d["tipo_clase"], suc):
         _guardar_dia(d, estatus="SinClase")
-      elif cm["escudos"] > 0 and cm.get("escudo_semana") != ini.isoformat():
-        _guardar_dia(d, estatus="Protegido")
-        cm["escudos"] -= 1
-        cm["escudo_semana"] = ini.isoformat()
-        evento(cm["id"], "escudo_usado", {"tipo": d["tipo_clase"], "dia": DIAS[f.isoweekday()], "escudos": cm["escudos"]})
-        await push_cliente(cid, "🛡️ Usaste un escudo",
-          f"No llegaste a {NOMBRE_TIPO.get(d['tipo_clase'], d['tipo_clase'])} el {DIAS[f.isoweekday()]}, pero tu semana {cm['semana_numero']} sigue en pie. Te quedan {cm['escudos']}.",
-          {"tipo": "meta_escudo"})
       else:
         _guardar_dia(d, estatus="Fallado")
-        # Solo esta semana vuelve a empezar; lo pendiente de esta semana ya no cuenta
-        for x in dias:
-          if x["estatus"] in ("Pendiente", "Reservado") and x["id"] != d["id"]:
-            _guardar_dia(x, estatus="Anulado")
         cm["racha"] = 0
-        cm["semanas_seguidas"] = 0
-        cm["semana_inicio"] = (ini + timedelta(days=7)).isoformat()
-        cm["intento"] += 1
-        evento(cm["id"], "semana_reiniciada", {"tipo": d["tipo_clase"], "dia": DIAS[f.isoweekday()],
-               "semana": cm["semana_numero"], "intento": cm["intento"]})
-        await push_cliente(cid, "Tu semana vuelve a empezar 💪",
-          f"No llegaste a {NOMBRE_TIPO.get(d['tipo_clase'], d['tipo_clase'])} el {DIAS[f.isoweekday()]}. Tu semana {cm['semana_numero']} empieza de nuevo el lunes; lo que ya lograste sigue intacto.",
-          {"tipo": "meta_semana_reiniciada"})
-        reiniciada = True
-        break
-    if reiniciada:
-      continue
 
-    # 4. ¿Terminó la semana?
+    # 3. ¿Terminó la semana?
     if h > fin:
-      cm["semanas_cumplidas"] += 1
-      cm["semanas_seguidas"] += 1
-      evento(cm["id"], "semana_cumplida", {"semana": cm["semana_numero"], "de": meta["semanas"]})
-      if cm["semanas_seguidas"] % 2 == 0 and cm["escudos"] < MAX_ESCUDOS:
-        cm["escudos"] += 1
-        evento(cm["id"], "escudo_ganado", {"razon": "dos_semanas", "escudos": cm["escudos"]})
-      if cm["semanas_cumplidas"] >= meta["semanas"]:
+      perfecta = bool(dias) and all(x["estatus"] in ("Cumplido", "SinClase") for x in dias)
+      if perfecta:
+        cm["semanas_cumplidas"] += 1
+        evento(cm["id"], "semana_cumplida", {"semana": cm["semana_numero"], "de": meta["semanas"],
+               "perfectas": cm["semanas_cumplidas"]})
+      if cm["semana_numero"] >= meta["semanas"]:
         cm["estatus"] = "Completada"
         cm["completada_at"] = datetime.now(timezone.utc).isoformat()
         evento(cm["id"], "meta_completada", resumen(cm, meta))
-        await push_cliente(cid, f"🏆 ¡Completaste tu meta!",
-          f"{meta['nombre']}: {meta['semanas']} semanas cumplidas. Abre la app para ver tu resumen.",
+        await push_cliente(cid, "¡Terminaste tu meta!",
+          f"{meta['nombre']}: {cm['semanas_cumplidas']} de {meta['semanas']} semanas perfectas. Abre la app para ver tu resumen.",
           {"tipo": "meta_completada"})
         break
-      await push_cliente(cid, f"✅ Semana {cm['semana_numero']} cumplida",
-        f"Llevas {cm['semanas_cumplidas']} de {meta['semanas']}. Ya empieza la semana {cm['semana_numero'] + 1}: {fase(cm['semana_numero'] + 1)}.",
-        {"tipo": "meta_semana_cumplida"})
       cm["semana_numero"] += 1
       cm["semana_inicio"] = (ini + timedelta(days=7)).isoformat()
-      cm["intento"] = 1
       continue
     break
 
-  cambios = {k: cm[k] for k in ("estatus", "semana_numero", "semana_inicio", "intento", "semanas_cumplidas",
-             "semanas_seguidas", "escudos", "escudo_semana", "extra_semana", "racha", "mejor_racha", "completada_at")
-             if cm.get(k) != orig.get(k)}
+  cambios = {k: cm[k] for k in ("estatus", "semana_numero", "semana_inicio", "semanas_cumplidas",
+             "racha", "mejor_racha", "completada_at") if cm.get(k) != orig.get(k)}
   if cambios:
     supabase.table("cliente_metas").update(cambios).eq("id", cm["id"]).execute()
   return cm
@@ -252,10 +226,10 @@ def resumen(cm: dict, meta: dict) -> dict:
     por_tipo[d["tipo_clase"]] = por_tipo.get(d["tipo_clase"], 0) + 1
   inicio = datetime.fromisoformat(cm["created_at"].replace("Z", "+00:00")).astimezone(CDMX).date()
   return {
-    "meta": meta["nombre"], "emoji": meta.get("emoji"), "semanas": meta["semanas"],
+    "meta": meta["nombre"], "icono": meta.get("icono"), "semanas": meta["semanas"],
     "dias_cumplidos": len(cumplidos), "dias_fallados": fallados,
     "escudos_usados": sum(1 for d in dias if d["estatus"] == "Protegido"),
-    "mejor_racha": cm["mejor_racha"], "por_tipo": por_tipo,
+    "mejor_racha": cm["mejor_racha"], "por_tipo": por_tipo, "semanas_perfectas": cm["semanas_cumplidas"],
     "constancia": round(100 * len(cumplidos) / max(len(cumplidos) + fallados, 1)),
     "semanas_calendario": max(1, ((hoy() - inicio).days // 7) + 1),
   }
@@ -275,21 +249,24 @@ async def evaluar_todas():
 async def recordatorio_noche():
   """20:00 CDMX: si mañana le toca clase y no ha reservado, le avisa con lugares disponibles."""
   manana = hoy() + timedelta(days=1)
-  dias = supabase.table("meta_dias").select("*, cliente_metas!inner(id, cliente_id, estatus, semana_numero, metas(semanas))")\
-    .eq("fecha", manana.isoformat()).eq("estatus", "Pendiente").eq("cliente_metas.estatus", "Activa").execute().data or []
+  dias = supabase.table("meta_dias").select("*, cliente_metas!inner(id, cliente_id, estatus, pausada, semana_numero, metas(semanas))")\
+    .eq("fecha", manana.isoformat()).eq("estatus", "Pendiente").eq("cliente_metas.estatus", "Activa")\
+    .eq("cliente_metas.pausada", False).execute().data or []
   enviados = 0
   for d in dias:
     cm = d["cliente_metas"]
+    if not tiene_plan(cm["cliente_id"]):
+      continue
     cli = supabase.table("clientes").select("sucursal_id").eq("id", cm["cliente_id"]).single().execute().data or {}
     disponibles = clases_del_dia(manana, d["tipo_clase"], cli.get("sucursal_id"), solo_futuras=True, con_lugar=True)
     nombre = NOMBRE_TIPO.get(d["tipo_clase"], d["tipo_clase"])
     if disponibles:
       c = disponibles[0]
       lugar = f"{c['libres']} {'lugar' if c['libres'] == 1 else 'lugares'}"
-      cuerpo = (f"Mañana es {DIAS[manana.isoweekday()]} y te toca {nombre} 💪 Quedan {lugar} a las {hora(c['horario'])}"
+      cuerpo = (f"Mañana es {DIAS[manana.isoweekday()]} y te toca {nombre}. Quedan {lugar} a las {hora(c['horario'])}"
                 f"{' en ' + c['sucursales']['nombre'] if c.get('sucursales') else ''}. Resérvala para seguir con tu meta.")
     else:
-      cuerpo = f"Mañana te toca {nombre} 💪 Reserva tu lugar para seguir con tu meta (semana {cm['semana_numero']})."
-    await push_cliente(cm["cliente_id"], f"Mañana: {nombre} 🎯", cuerpo, {"tipo": "meta_recordatorio"})
+      cuerpo = f"Mañana te toca {nombre}. Reserva tu lugar para seguir con tu meta (semana {cm['semana_numero']})."
+    await push_cliente(cm["cliente_id"], f"Mañana: {nombre}", cuerpo, {"tipo": "meta_recordatorio"})
     enviados += 1
   print(f"🎯 Recordatorios de metas enviados: {enviados}")

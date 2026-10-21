@@ -44,7 +44,7 @@ async def mia(request: Request):
   if cm:
     cm = await M.evaluar(cm)
   estadisticas = _estadisticas(cli["id"])
-  historial = supabase.table("cliente_metas").select("id, estatus, created_at, completada_at, semanas_cumplidas, mejor_racha, metas(nombre, emoji)")\
+  historial = supabase.table("cliente_metas").select("id, estatus, created_at, completada_at, semanas_cumplidas, mejor_racha, metas(nombre, emoji, icono)")\
     .eq("cliente_id", cli["id"]).neq("estatus", "Activa").order("created_at", desc=True).limit(10).execute().data or []
 
   # Eventos sin ver (incluye el de una meta que se acaba de completar)
@@ -54,7 +54,7 @@ async def mia(request: Request):
     .order("created_at").execute().data if ids else []
 
   if not cm or cm["estatus"] != "Activa":
-    return {"meta": None, "estadisticas": estadisticas, "historial": historial, "eventos": eventos or []}
+    return {"meta": None, "tiene_plan": M.tiene_plan(cli["id"]), "estadisticas": estadisticas, "historial": historial, "eventos": eventos or []}
 
   meta = supabase.table("metas").select("*").eq("id", cm["meta_id"]).single().execute().data
   split = {s["dia_semana"]: s["tipo_clase"] for s in
@@ -69,7 +69,7 @@ async def mia(request: Request):
     d = dias_db.get(f.isoformat())
     item = {"dia_semana": n, "fecha": f.isoformat(), "tipo": split.get(n), "toca": n in cm["dias"],
             "estatus": d["estatus"] if d else ("Descanso" if n not in cm["dias"] else "Pendiente"),
-            "es_hoy": f == h, "clase": None}
+            "es_hoy": f == h, "clase": None, "reserva_id": d.get("reserva_id") if d else None}
     if d and d.get("clase_id"):
       c = supabase.table("clases").select("nombre_clase, horario, sucursales(nombre), staff(nombre, primer_apellido)")\
         .eq("id", d["clase_id"]).limit(1).execute().data
@@ -77,27 +77,123 @@ async def mia(request: Request):
         item["clase"] = {**c[0], "hora": M.hora(c[0]["horario"])}
     semana.append(item)
 
-  # La siguiente clase que le toca (hoy o después) y si ya la reservó
-  siguiente = next((x for x in semana if x["toca"] and x["fecha"] >= h.isoformat()
-                    and x["estatus"] in ("Pendiente", "Reservado")), None)
-  if siguiente and siguiente["estatus"] == "Pendiente":
-    siguiente["disponibles"] = [
-      {"id": c["id"], "nombre": c["nombre_clase"], "hora": M.hora(c["horario"]), "libres": c["libres"],
-       "sucursal": (c.get("sucursales") or {}).get("nombre"),
-       "coach": f"{(c.get('staff') or {}).get('nombre', '')} {((c.get('staff') or {}).get('primer_apellido') or '')[:1]}.".strip()}
-      for c in M.clases_del_dia(date.fromisoformat(siguiente["fecha"]), siguiente["tipo"], cli.get("sucursal_id"),
-                                solo_futuras=True, con_lugar=True)[:4]
-    ]
+  # Reserva tu semana: los días que faltan, con sus horarios y uno sugerido
+  hora_habitual = _hora_habitual(cli["id"])
+  por_reservar = []
+  if not cm.get("pausada"):
+    for x in semana:
+      if not x["toca"] or x["fecha"] < h.isoformat() or x["estatus"] != "Pendiente":
+        continue
+      opciones = [
+        {"id": c["id"], "nombre": (c.get("nombre_clase") or "").strip(), "hora": M.hora(c["horario"]), "libres": c["libres"],
+         "coach": ((c.get("staff") or {}).get("nombre") or "").strip(), "sucursal": (c.get("sucursales") or {}).get("nombre")}
+        for c in M.clases_del_dia(date.fromisoformat(x["fecha"]), x["tipo"], cli.get("sucursal_id"), solo_futuras=True, con_lugar=True)
+      ]
+      if not opciones:
+        por_reservar.append({**x, "opciones": [], "sugerida": None}); continue
+      sugerida = min(opciones, key=lambda o: abs(_minutos(o["hora"]) - hora_habitual)) if hora_habitual is not None else opciones[0]
+      por_reservar.append({**x, "opciones": opciones, "sugerida": sugerida["id"]})
 
   return {
     "meta": {
       **cm, "nombre": meta["nombre"], "enfoque": meta["enfoque"], "explicacion": meta["explicacion"],
-      "emoji": meta["emoji"], "color": meta["color"], "semanas": meta["semanas"],
+      "emoji": meta["emoji"], "icono": meta.get("icono"), "color": meta["color"], "semanas": meta["semanas"],
       "fase": M.fase(cm["semana_numero"]), "split": split,
     },
-    "semana": semana, "siguiente": siguiente,
+    "semana": semana, "por_reservar": por_reservar,
+    "tiene_plan": M.tiene_plan(cli["id"]), "pausada": bool(cm.get("pausada")),
     "estadisticas": estadisticas, "historial": historial, "eventos": eventos or [],
   }
+
+
+def _minutos(hhmm: str) -> int:
+  h, m = hhmm.split(":")
+  return int(h) * 60 + int(m)
+
+
+def _hora_habitual(cliente_id: str) -> int | None:
+  """La hora a la que más reserva (en minutos del día), para sugerir horarios."""
+  r = supabase.table("reservas").select("clases(horario)").eq("cliente_id", cliente_id)\
+    .neq("estatus", "Cancelada").order("created_at", desc=True).limit(30).execute().data or []
+  horas = [_minutos(M.hora(x["clases"]["horario"])) for x in r if (x.get("clases") or {}).get("horario")]
+  if not horas:
+    return None
+  return max(set(horas), key=horas.count)
+
+
+@router.post("/reservar-semana")
+async def reservar_semana(request: Request):
+  """Reserva de un jalón las clases que eligió (lugar asignado automáticamente)."""
+  cli = _cliente(request)
+  b = await request.json()
+  ids = [i for i in (b.get("clases") or []) if i][:7]
+  if not ids:
+    raise HTTPException(status_code=400, detail="Elige al menos una clase.")
+  from routers.sincronizacion import sincronizar_cupos
+  import httpx, os
+  backend = os.getenv("BACKEND_PUBLIC_URL", "https://navy-traning-backend-production.up.railway.app")
+
+  resultados = []
+  for clase_id in ids:
+    c = supabase.table("clases").select("id, nombre_clase, horario, room_id, capacidad_max, estado")\
+      .eq("id", clase_id).limit(1).execute().data
+    if not c or (c[0].get("estado") or "Activa") != "Activa":
+      resultados.append({"clase_id": clase_id, "ok": False, "error": "La clase ya no está disponible."}); continue
+    c = c[0]
+    dia = datetime.fromisoformat(c["horario"].replace("Z", "+00:00")).astimezone(M.CDMX).date().isoformat()
+    nombre = (c.get("nombre_clase") or "").strip()
+
+    # Su plan para ese día (y que le queden clases)
+    memb = supabase.table("membresias").select("id, paquetes(clases_incluidas, acceso_total)").eq("cliente_id", cli["id"])\
+      .eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,and(fecha_inicio.lte.{dia},fecha_fin.gte.{dia})")\
+      .limit(1).execute().data
+    if not memb:
+      resultados.append({"clase_id": clase_id, "ok": False, "clase": nombre, "error": "Tu plan no cubre ese día."}); continue
+    incluidas = (memb[0].get("paquetes") or {}).get("clases_incluidas")
+    if incluidas:
+      usadas = supabase.table("reservas").select("id", count="exact").eq("membresia_id", memb[0]["id"]).neq("estatus", "Cancelada").execute().count or 0
+      if usadas >= incluidas:
+        resultados.append({"clase_id": clase_id, "ok": False, "clase": nombre, "error": "Ya usaste todas las clases de tu paquete."}); continue
+
+    if supabase.table("reservas").select("id").eq("cliente_id", cli["id"]).eq("clase_id", clase_id).neq("estatus", "Cancelada").limit(1).execute().data:
+      resultados.append({"clase_id": clase_id, "ok": True, "clase": nombre, "ya_estaba": True}); continue
+
+    # Lugar: el primer spot libre (si otro lo toma al mismo tiempo, se intenta el siguiente)
+    spots = [x["id"] for x in (supabase.table("room_spots").select("id, numero").eq("room_id", c["room_id"]).order("numero").execute().data or [])] if c.get("room_id") else [None]
+    ocupados = {x["spot_id"] for x in (supabase.table("reservas").select("spot_id").eq("clase_id", clase_id).neq("estatus", "Cancelada").execute().data or [])}
+    libres = [x for x in spots if x not in ocupados] or ([None] if not c.get("room_id") else [])
+    reserva, error = None, "La clase se llenó."
+    for spot in libres[:3]:
+      try:
+        reserva = supabase.table("reservas").insert({
+          "cliente_id": cli["id"], "clase_id": clase_id, "room_id": c.get("room_id"), "spot_id": spot,
+          "estatus": "Confirmada", "origen": "App", "membresia_id": memb[0]["id"],
+        }).execute().data[0]
+        break
+      except Exception as ex:
+        msg = str(ex)
+        if "CLASE_LLENA" in msg:
+          error = "La clase se llenó."; break
+        if "SPOT_OCUPADO" in msg:
+          continue
+        error = "No se pudo reservar."; break
+    if not reserva:
+      resultados.append({"clase_id": clase_id, "ok": False, "clase": nombre, "error": error}); continue
+
+    try:
+      await sincronizar_cupos(clase_id)
+      async with httpx.AsyncClient(timeout=20) as hc:
+        await hc.post(f"{backend}/reservas/confirmar-notificacion",
+                      json={"reserva_id": reserva["id"], "cliente_id": cli["id"], "clase_id": clase_id})
+    except Exception as ex:
+      print("reservar-semana avisos:", ex)
+    resultados.append({"clase_id": clase_id, "ok": True, "clase": nombre, "reserva_id": reserva["id"]})
+
+  # Que la meta se entere al momento
+  cm = _activa(cli["id"])
+  if cm:
+    await M.evaluar(cm)
+  return {"resultados": resultados, "reservadas": sum(1 for r in resultados if r["ok"])}
 
 
 def _estadisticas(cliente_id: str) -> dict:
@@ -141,6 +237,8 @@ async def elegir(request: Request):
   if not meta:
     raise HTTPException(status_code=404, detail="Meta no encontrada")
   meta = meta[0]
+  if not M.tiene_plan(cli["id"]):
+    raise HTTPException(status_code=403, detail="Las metas son parte de tu plan. Compra o renueva tu plan para empezar.")
   dias = sorted({int(d) for d in (b.get("dias") or []) if 1 <= int(d) <= 7})
   if len(dias) < meta["min_dias"] or len(dias) > 6:
     raise HTTPException(status_code=400, detail=f"Elige entre {meta['min_dias']} y 6 días (uno es para descansar).")
@@ -155,6 +253,7 @@ async def elegir(request: Request):
     inicio += timedelta(days=7)          # esta semana ya no le quedan días: empieza el lunes
   cm = supabase.table("cliente_metas").insert({
     "cliente_id": cli["id"], "meta_id": meta["id"], "dias": dias, "semana_inicio": inicio.isoformat(),
+    "cuenta_desde": h.isoformat(),
   }).execute().data[0]
   await M.evaluar(cm)
   return {"ok": True, "id": cm["id"], "empieza": inicio.isoformat() if inicio > h else h.isoformat()}
