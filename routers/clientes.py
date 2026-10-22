@@ -14,6 +14,26 @@ class InvitadoRequest(BaseModel):
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
+@router.post("/crear")
+async def crear_cliente(req: dict):
+  try:
+    datos = {
+      "nombre_completo":     req.get("nombre"),
+      "email":               req.get("email"),
+      "telefono":            req.get("telefono"),
+      "sucursal_id":         req.get("sucursal_id"),
+      "estatus":             "Activo",
+      "origen":              "App",
+      "acepto_terminos":     req.get("acepto_terminos", False),
+      "acepto_privacidad":   req.get("acepto_privacidad", False),
+      "fecha_alta_original": req.get("fecha_alta_original"),
+      "debe_cambiar_password": False,
+    }
+    res = supabase.table("clientes").insert(datos).execute()
+    return { "ok": True, "id": res.data[0]["id"] }
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/crear-invitado")
 async def crear_invitado(req: InvitadoRequest):
   import random, string

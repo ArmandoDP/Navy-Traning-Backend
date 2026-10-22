@@ -205,10 +205,10 @@ async def check_no_shows():
       if ya_penalizado and ya_penalizado.data:
         continue # Ya fue penalizado
 
-      monto = paquete.get("monto_penalizacion", 150)
+      monto = paquete.get("monto_penalizacion") or 150
 
       # Crear penalización
-      supabase.table("penalizaciones_noshow").insert({
+      pen_res = supabase.table("penalizaciones_noshow").insert({
         "cliente_id": cliente_id,
         "reserva_id": reserva["id"],
         "clase_id":   clase["id"],
@@ -227,12 +227,29 @@ async def check_no_shows():
 
 
       
-      await enviar_push(
-        tokens,
-        titulo="⚠️ No Show registrado",
-        cuerpo=f"No te presentaste a {clase['nombre_clase']}. Tienes un cargo pendiente de ${monto} MXN.",
-        data={ "tipo": "no_show", "monto": monto }
-      )
+      # Cobro automático a la tarjeta guardada
+      cobro = {"ok": False}
+      try:
+        from services.stripe_service import cobrar_penalizacion_automatica
+        if pen_res.data:
+          cobro = await cobrar_penalizacion_automatica(pen_res.data[0]["id"])
+      except Exception as e:
+        print(f"Error cobrando no-show automático: {e}")
+
+      if cobro.get("ok"):
+        await enviar_push(
+          tokens,
+          titulo="No Show cobrado",
+          cuerpo=f"No te presentaste a {clase['nombre_clase']}. Se cobraron ${monto} MXN a tu {cobro.get('metodo', 'tarjeta')}.",
+          data={ "tipo": "no_show_cobrado", "monto": monto }
+        )
+      else:
+        await enviar_push(
+          tokens,
+          titulo="⚠️ No Show registrado",
+          cuerpo=f"No te presentaste a {clase['nombre_clase']}. Tienes un cargo pendiente de ${monto} MXN. Entra a la app para pagarlo.",
+          data={ "tipo": "no_show", "monto": monto }
+        )
 
     # Al final del loop — marcar clase como Finalizada
     supabase.table("clases").update({ "estado_actual": "Finalizada" })\
@@ -240,107 +257,14 @@ async def check_no_shows():
     print(f"Clase {clase['nombre_clase']} marcada como Finalizada")
 
 async def renovar_membresias_recurrentes():
-  from datetime import date, timedelta
-  from services.orkestapay import cobrar_tarjeta_guardada
-  import uuid
+  """Desactivada: las renovaciones ahora las cobra Stripe (suscripciones)."""
+  print("⏸ renovar_membresias_recurrentes desactivada — Stripe cobra las renovaciones")
+  return
 
-  hoy = date.today()
-  en_3_dias = hoy + timedelta(days=3)
-
-  # Buscar membresías recurrentes que vencen en 3 días
-  res = supabase.table("membresias")\
-    .select("*, clientes(id, nombre_completo, email, sucursal_id, orkestapay_customer_id), paquetes(nombre, precio, vigencia_dias, es_recurrente)")\
-    .eq("estatus", "Activa")\
-    .lte("fecha_fin", en_3_dias.isoformat())\
-    .gte("fecha_fin", hoy.isoformat())\
-    .execute()
-
-  for memb in (res.data or []):
-    cliente  = memb.get("clientes", {})
-    paquete  = memb.get("paquetes", {})
-
-    # Solo renovar si el paquete es recurrente
-    if not paquete.get("es_recurrente"):
-      continue
-
-    customer_id = cliente.get("orkestapay_customer_id")
-    sucursal_id = cliente.get("sucursal_id")
-    cliente_id  = cliente.get("id")
-
-    if not customer_id or not sucursal_id:
-      print(f"Sin customer_id o sucursal_id para cliente {cliente_id}")
-      continue
-
-    # Obtener método de pago guardado
-    try:
-      from services.orkestapay import listar_metodos_pago
-      metodos = await listar_metodos_pago(sucursal_id, customer_id)
-      content = metodos.get("content", [])
-      if not content:
-        print(f"Sin tarjeta guardada para cliente {cliente_id}")
-        continue
-
-      payment_method_id = content[0].get("payment_method_id")
-      monto             = memb.get("precio_pagado", paquete.get("precio", 0))
-      idempotency_key   = str(uuid.uuid4()).replace("-", "")
-
-      resultado = await cobrar_tarjeta_guardada(
-        sucursal_id       = sucursal_id,
-        customer_id       = customer_id,
-        payment_method_id = payment_method_id,
-        monto             = monto,
-        concepto          = f"Renovación {paquete.get('nombre')}",
-        idempotency_key   = idempotency_key,
-      )
-
-      # Crear nueva membresía
-      nueva_inicio = memb["fecha_fin"]
-      nueva_fin    = (date.fromisoformat(memb["fecha_fin"]) + timedelta(days=paquete.get("vigencia_dias", 30))).isoformat()
-
-      supabase.table("membresias").update({ "estatus": "Inactiva" }).eq("id", memb["id"]).execute()
-      supabase.table("membresias").insert({
-        "cliente_id":    cliente_id,
-        "paquete_id":    memb["paquete_id"],
-        "fecha_inicio":  nueva_inicio,
-        "fecha_fin":     nueva_fin,
-        "estatus":       "Activa",
-        "precio_pagado": monto,
-        "origen":        "Renovacion",
-      }).execute()
-
-      # Registrar pago
-      supabase.table("pagos").insert({
-        "cliente_id":  cliente_id,
-        "monto":       monto,
-        "estatus":     "Completado",
-        "metodo_pago": "Tarjeta",
-        "canal":       "Navy",
-        "concepto":    f"Renovación automática — {paquete.get('nombre')}",
-        "fecha_pago":  hoy.isoformat(),
-        "sucursal_id": sucursal_id,
-      }).execute()
-
-      # Actualizar fecha_venc_plan en cliente
-      supabase.table("clientes").update({ "fecha_venc_plan": nueva_fin }).eq("id", cliente_id).execute()
-
-      print(f"✅ Renovada membresía de {cliente.get('email')} hasta {nueva_fin}")
-
-    except Exception as e:
-      print(f"❌ Error renovando membresía de {cliente_id}: {e}")
-
-      # Crear alerta de pago fallido
-      supabase.table("alertas").insert({
-        "tipo":        "pago_fallido",
-        "categoria":   "operacion",
-        "titulo":      f"Renovación fallida — {cliente.get('nombre_completo')}",
-        "descripcion": str(e),
-        "cliente_id":  cliente_id,
-      }).execute()
 
 async def check_renovaciones_recurrentes():
   """Corre diario a las 8am — intenta cobrar membresías recurrentes próximas a vencer"""
   from datetime import date, timedelta
-  from services.orkestapay import cobrar_tarjeta_guardada, listar_metodos_pago
   import uuid
 
   hoy      = date.today()
@@ -369,7 +293,7 @@ async def check_renovaciones_recurrentes():
     fecha_vence = hoy + timedelta(days=dias)
 
     membresias = supabase.table("membresias")\
-      .select("*, renovacion_cancelada, clientes(id, nombre_completo, email, sucursal_id, orkestapay_customer_id, push_tokens(token)), paquetes(id, nombre, precio, vigencia_dias, es_recurrente, penalizacion_noshow)")\
+      .select("*, renovacion_cancelada, clientes(id, nombre_completo, email, sucursal_id, stripe_subscription_id, push_tokens(token)), paquetes(id, nombre, precio, vigencia_dias, es_recurrente, penalizacion_noshow)")\
       .eq("estatus", "Activa")\
       .eq("fecha_fin", fecha_vence.isoformat())\
       .execute()
@@ -388,80 +312,20 @@ async def check_renovaciones_recurrentes():
         continue
 
       if es_recurrente:
-        # Intentar cobro automático
-        customer_id = cliente.get("orkestapay_customer_id")
-        sucursal_id = cliente.get("sucursal_id")
-        cliente_id  = cliente.get("id")
+        sub_id = m.get("stripe_subscription_id") or cliente.get("stripe_subscription_id")
+        if sub_id:
+          # Stripe la renueva solo; solo recordamos 3 días antes
+          if dias == 3:
+            await enviar_push(tokens,
+              titulo="🔄 Tu plan se renueva pronto",
+              cuerpo=f"Tu plan {paquete.get('nombre')} se renovará automáticamente el {m['fecha_fin']}.",
+              data={"tipo": "renovacion_proxima", "membresia_id": m["id"]})
+          continue
 
-        cobrado = False
-        if customer_id and sucursal_id:
-          try:
-            metodos = await listar_metodos_pago(sucursal_id, customer_id)
-            content = metodos.get("content", [])
-            if content:
-              payment_method_id = content[0].get("payment_method_id")
-              monto = m.get("precio_pagado", paquete.get("precio", 0))
-
-              resultado = await cobrar_tarjeta_guardada(
-                sucursal_id       = sucursal_id,
-                customer_id       = customer_id,
-                payment_method_id = payment_method_id,
-                monto             = monto,
-                concepto          = f"Renovación {paquete.get('nombre')}",
-                idempotency_key   = str(uuid.uuid4()).replace("-", ""),
-              )
-
-              # Crear nueva membresía
-              nueva_fin = (date.fromisoformat(m["fecha_fin"]) + timedelta(days=paquete.get("vigencia_dias", 30))).isoformat()
-              supabase.table("membresias").update({ "estatus": "Inactiva" }).eq("id", m["id"]).execute()
-              supabase.table("membresias").insert({
-                "cliente_id":    cliente_id,
-                "paquete_id":    m["paquete_id"],
-                "fecha_inicio":  m["fecha_fin"],
-                "fecha_fin":     nueva_fin,
-                "estatus":       "Activa",
-                "precio_pagado": monto,
-                "origen":        "Renovacion",
-              }).execute()
-              supabase.table("clientes").update({ "fecha_venc_plan": nueva_fin }).eq("id", cliente_id).execute()
-              supabase.table("pagos").insert({
-                "cliente_id":  cliente_id,
-                "monto":       monto,
-                "estatus":     "Completado",
-                "metodo_pago": "Tarjeta",
-                "canal":       "Navy",
-                "concepto":    f"Renovación automática — {paquete.get('nombre')}",
-                "fecha_pago":  hoy.isoformat(),
-                "sucursal_id": sucursal_id,
-              }).execute()
-
-              cobrado = True
-              print(f"✅ Renovada membresía de {email}")
-
-              # Push y correo de renovación exitosa
-              await enviar_push(tokens,
-                titulo="✅ Membresía renovada",
-                cuerpo=f"Tu plan {paquete.get('nombre')} se renovó automáticamente. ¡Sigue entrenando!",
-                data={"tipo": "renovacion_exitosa"})
-              await enviar_correo(email, nombre,
-                "Tu membresía Navy se renovó automáticamente 🎉",
-                f"Tu plan <strong>{paquete.get('nombre')}</strong> se renovó exitosamente. Tu nueva fecha de vencimiento es <strong>{nueva_fin}</strong>.")
-              continue  # Ya se renovó, no mandar aviso de vencimiento
-
-          except Exception as e:
-            print(f"❌ Error cobrando renovación de {email}: {e}")
-            supabase.table("alertas").insert({
-              "tipo":        "pago_fallido",
-              "categoria":   "operacion",
-              "titulo":      f"Renovación fallida — {cliente.get('nombre_completo')}",
-              "descripcion": str(e),
-              "cliente_id":  cliente_id,
-            }).execute()
-
-        # Cobro falló o sin tarjeta — mandar aviso
-        msg_push = f"Tenemos un problema con tu tarjeta. Actualízala para renovar tu plan {paquete.get('nombre')} que vence en {dias} día{'s' if dias > 1 else ''}."
-        msg_correo = f"Intentamos renovar tu plan <strong>{paquete.get('nombre')}</strong> automáticamente pero no pudimos cobrar tu tarjeta. Tu membresía vence en <strong>{dias} día{'s' if dias > 1 else ''}</strong>. Por favor actualiza tu método de pago."
-        subj = f"⚠️ Problema con tu renovación — vence en {dias} día{'s' if dias > 1 else ''}"
+        # Recurrente sin tarjeta guardada en Stripe: pedirle que la agregue
+        msg_push   = f"Tu plan {paquete.get('nombre')} vence en {dias} día{'s' if dias > 1 else ''}. Agrega tu tarjeta en la app para que se renueve solo y conserves tu precio."
+        msg_correo = f"Tu plan <strong>{paquete.get('nombre')}</strong> vence en <strong>{dias} día{'s' if dias > 1 else ''}</strong>. Entra a la app y agrega tu tarjeta para que se renueve automáticamente y conserves tu precio actual."
+        subj       = f"Conserva tu plan {paquete.get('nombre')} — vence en {dias} día{'s' if dias > 1 else ''}"
 
       else:
         # Pago único — solo avisar que vence
@@ -475,14 +339,19 @@ async def check_renovaciones_recurrentes():
         data={"tipo": "membresia_vence", "membresia_id": m["id"]})
       await enviar_correo(email, nombre, subj, msg_correo)
 
-  # Día del vencimiento — cancelar membresías vencidas
+  # No vencer por fecha los paquetes tipo 'clases'
   membresias_vencidas = supabase.table("membresias")\
-    .select("*, clientes(id, nombre_completo, email, push_tokens(token))")\
+    .select("*, clientes(id, nombre_completo, email, push_tokens(token)), paquetes(tipo)")\
     .eq("estatus", "Activa")\
     .lt("fecha_fin", hoy.isoformat())\
     .execute()
 
   for m in (membresias_vencidas.data or []):
+    # Saltar paquetes de tipo 'clases'
+    if m.get("paquetes", {}).get("tipo") == "clases":
+      print(f"Paquete tipo clases — no se vence por fecha: {m['id']}")
+      continue
+    
     cliente  = m.get("clientes", {})
     nombre   = (cliente.get("nombre_completo") or "").split()[0]
     email    = cliente.get("email")
@@ -490,7 +359,18 @@ async def check_renovaciones_recurrentes():
     cliente_id = cliente.get("id")
 
     supabase.table("membresias").update({ "estatus": "Inactiva" }).eq("id", m["id"]).execute()
-    supabase.table("clientes").update({ "estatus": "Inactivo" }).eq("id", cliente_id).execute()
+    
+    # Verificar si tiene otra membresía activa antes de marcar inactivo
+    otras_membresias = supabase.table("membresias").select("id")\
+      .eq("cliente_id", cliente_id)\
+      .eq("estatus", "Activa")\
+      .neq("id", m["id"])\
+      .execute()
+
+    if not otras_membresias.data:
+      supabase.table("clientes").update({ "estatus": "Inactivo" }).eq("id", cliente_id).execute()
+    else:
+      print(f"Cliente {email} tiene otra membresía activa — no se marca inactivo")
 
     await enviar_push(tokens,
       titulo="❌ Tu membresía ha vencido",

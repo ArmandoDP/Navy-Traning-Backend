@@ -49,3 +49,20 @@ async def run_reactivar_pausas(x_cron_secret: str = Header(None)):
   from services.push import check_reactivar_pausas
   await check_reactivar_pausas()
   return { "ok": True, "job": "reactivar_pausas" }
+@router.post("/sincronizar-planes")
+async def run_sincronizar_planes(x_cron_secret: str = Header(None)):
+  if x_cron_secret != CRON_SECRET:
+    raise HTTPException(status_code=401, detail="Unauthorized")
+  from services.supabase import supabase
+  
+  # Obtener clientes con membresía activa
+  membs = supabase.table("membresias").select("cliente_id, paquete_id, paquetes(nombre)")\
+    .eq("estatus", "Activa").execute()
+  
+  for m in (membs.data or []):
+    supabase.table("clientes").update({
+      "plan":       m["paquetes"]["nombre"] if m.get("paquetes") else "",
+      "paquete_id": m["paquete_id"],
+    }).eq("id", m["cliente_id"]).execute()
+
+  return { "ok": True, "job": "sincronizar_planes", "actualizados": len(membs.data or []) }
