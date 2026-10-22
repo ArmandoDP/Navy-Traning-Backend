@@ -1,8 +1,11 @@
 from fastapi import FastAPI
+app = FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from routers import crons, pagos, totalpass, totalpass_booking, clientes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from routers import membresias
+app.include_router(membresias.router, prefix="/membresias")
 from services.push import (
   check_recordatorios_clase,
   check_membresias_por_vencer,
