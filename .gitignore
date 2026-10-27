@@ -39,3 +39,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Llaves y variables de entorno: NUNCA se suben
+.env
+backend/env.env
+*.env

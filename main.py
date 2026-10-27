@@ -6,6 +6,7 @@ from routers import (
   confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes, metas, lista_espera, mis_pagos, clientes_admin, promociones,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from services.pausas import reanudar_pausas_vencidas
 from services.push import (
   check_recordatorios_clase,
   check_membresias_por_vencer,
@@ -70,6 +71,7 @@ async def startup():
   scheduler.add_job(check_clases_en_curso,         'cron', minute='*/15')
   scheduler.add_job(sincronizar_stripe_membresias, 'interval', minutes=10)
   scheduler.add_job(activar_membresias_por_tiempo, 'cron', hour=6,  minute=10)   # 00:10 CDMX
+  scheduler.add_job(reanudar_pausas_vencidas,      'cron', hour=6,  minute=2)    # 00:02 CDMX: termina la pausa
   scheduler.add_job(invitar_a_reservar,            'cron', hour=16, minute=0)    # 10:00 CDMX
   scheduler.add_job(sincronizar_estado_clientes,   'cron', minute=5)              # cada hora (incluye 00:05 CDMX)
   scheduler.add_job(evaluar_metas,                 'cron', minute='*/15')          # check-ins, días y semanas

@@ -46,8 +46,8 @@ async def run_renovar_membresias(x_cron_secret: str = Header(None)):
 async def run_reactivar_pausas(x_cron_secret: str = Header(None)):
   if x_cron_secret != CRON_SECRET:
     raise HTTPException(status_code=401, detail="Unauthorized")
-  from services.push import check_reactivar_pausas
-  await check_reactivar_pausas()
+  from services.pausas import reanudar_pausas_vencidas
+  await reanudar_pausas_vencidas()
   return { "ok": True, "job": "reactivar_pausas" }
 @router.post("/sincronizar-planes")
 async def run_sincronizar_planes(x_cron_secret: str = Header(None)):
