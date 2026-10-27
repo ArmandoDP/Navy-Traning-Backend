@@ -156,7 +156,7 @@ async def crear_solicitud(request: Request):
     c = ss._preparar_compra(cliente_id, paquete_id, None, "solicitud")
   except ValueError as e:
     raise HTTPException(status_code=400, detail=str(e))
-  paq, monto = c["paq"], c["monto"]
+  paq, monto = c["paq"], c.get("monto_hoy", c["monto"])
 
   # Un solo cobro pendiente por cliente: el nuevo reemplaza al anterior
   supabase.table("solicitudes_pago").update({"estatus": "Cancelada"})\

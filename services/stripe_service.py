@@ -2,6 +2,7 @@
 # Todo lo que habla con la API de Stripe.
 import os
 import stripe
+from services import promociones as promos
 from datetime import date, datetime, timedelta, timezone
 from services.supabase          import supabase
 from services.stripe_activacion import _uno, membresia_activa, marcar_penalizacion_pagada, CDMX
@@ -186,28 +187,11 @@ def _sesion_pago(base: dict, msi: bool = True):
 
 def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str,
                      extra_meta: dict | None = None) -> dict:
-  paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus, visible_en_app", id=paquete_id)
-  if not paq or (paq.get("estatus") and paq["estatus"] != "Activo"):
-    raise ValueError("Este paquete no está disponible")
-  # Oculto en la app: solo se vende con link de pago o en sucursal
-  if origen == "app" and paq.get("visible_en_app") is False:
-    raise ValueError("Este paquete no está disponible en la app")
-  cli = _uno("clientes", "id, sucursal_id", id=cliente_id)
-  if not cli:
-    raise ValueError("Cliente no encontrado")
-  suc   = sucursal_id or cli.get("sucursal_id")
-  monto = precio_paquete(paq, suc)
-  memb  = membresia_activa(cliente_id)
-
-  # Quien renueva el mismo paquete recurrente conserva su precio (fundadores)
-  if paq.get("es_recurrente") and memb and memb.get("paquete_id") == paquete_id and memb.get("precio_pagado"):
-    monto = float(memb["precio_pagado"])
-  if monto <= 0:
-    raise ValueError("El paquete no tiene precio en esta sucursal")
+  c = _preparar_compra(cliente_id, paquete_id, sucursal_id, origen)
+  paq, monto, memb, suc = c["paq"], c["monto"], c["memb"], c["meta"]["sucursal_id"]
 
   customer = get_or_create_customer(cliente_id)
-  meta = _meta({"tipo": "paquete", "cliente_id": cliente_id, "paquete_id": paquete_id,
-                "sucursal_id": suc, "origen": origen, "monto": monto, **(extra_meta or {})})
+  meta = _meta({**c["meta"], **(extra_meta or {})})
   ok_url, cancel_url = _urls(origen)
   producto = {"currency": "mxn", "unit_amount": centavos(monto),
               "product_data": {"name": paq["nombre"], "metadata": {"paquete_id": paquete_id}}}
@@ -223,6 +207,7 @@ def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, 
       mode="subscription", customer=customer, client_reference_id=cliente_id,
       line_items=[{"price_data": {**producto, "recurring": intervalo(paq.get("vigencia_dias") or 30)}, "quantity": 1}],
       subscription_data=sub, metadata=meta, success_url=ok_url, cancel_url=cancel_url, locale="es",
+      **({"discounts": [{"coupon": c["meta"]["cupon_stripe"]}]} if c["meta"].get("cupon_stripe") else {}),
     )
   else:
     s = _sesion_pago(dict(
@@ -231,7 +216,8 @@ def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, 
       payment_intent_data={"metadata": meta, "description": f"{paq['nombre']} — Navy Training Center"},
       success_url=ok_url, cancel_url=cancel_url, locale="es",
     ))
-  return {"url": s.url, "session_id": s.id, "monto": monto, "recurrente": bool(paq.get("es_recurrente"))}
+  return {"url": s.url, "session_id": s.id, "monto": c["monto_hoy"], "recurrente": bool(paq.get("es_recurrente")),
+          "promocion": c["promo"]["texto"] if c.get("promo") else None}
 
 
 def checkout_penalizacion(penalizacion_id: str, origen: str) -> dict:
@@ -348,13 +334,29 @@ def _preparar_compra(cliente_id: str, paquete_id: str, sucursal_id: str | None, 
     monto = float(memb["precio_pagado"])
   if monto <= 0:
     raise ValueError("El paquete no tiene precio en esta sucursal")
+  renueva_mismo = bool(paq.get("es_recurrente") and memb and memb.get("paquete_id") == paquete_id and memb.get("precio_pagado"))
   customer = get_or_create_customer(cliente_id)
   meta = {"tipo": "paquete", "cliente_id": cliente_id, "paquete_id": paquete_id,
           "sucursal_id": suc, "origen": origen, "monto": monto}
-  return {"paq": paq, "monto": monto, "memb": memb, "customer": customer, "meta": meta}
+
+  # Promoción (se aplica sola). Recurrente: la suscripción lleva el precio normal + cupón de Stripe por su duración.
+  promo = None if renueva_mismo else promos.mejor_promocion(cliente_id, "paquete", paquete_id, suc, monto,
+                                                            recurrente=bool(paq.get("es_recurrente")))
+  monto_hoy = monto
+  if promo:
+    monto_hoy = promo["precio_final"]
+    meta.update({"promocion_id": promo["promocion_id"], "precio_original": monto, "monto": monto_hoy})
+    if paq.get("es_recurrente"):
+      meta["cupon_stripe"] = promos.cupon_stripe(promo, paquete_id)
+    else:
+      monto = monto_hoy
+    promos.registrar_uso(promo, cliente_id, "paquete", paquete_id, origen)
+  return {"paq": paq, "monto": monto, "monto_hoy": monto_hoy, "promo": promo, "memb": memb, "customer": customer, "meta": meta}
 
 
 def crear_suscripcion(customer: str, paq: dict, monto: float, meta: dict, **extra):
+  if meta.get("cupon_stripe") and "discounts" not in extra:
+    extra["discounts"] = [{"coupon": meta["cupon_stripe"]}]
   return stripe.Subscription.create(
     customer=customer,
     items=[{"price_data": {"currency": "mxn", "product": _producto(paq), "unit_amount": centavos(monto),
@@ -366,8 +368,11 @@ def crear_suscripcion(customer: str, paq: dict, monto: float, meta: dict, **extr
 def hoja_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str) -> dict:
   c = _preparar_compra(cliente_id, paquete_id, sucursal_id, origen)
   paq, monto, customer, meta = c["paq"], c["monto"], c["customer"], c["meta"]
-  base = {"customer": customer, "ephemeral_key": _ephemeral_key(customer), "monto": monto,
-          "recurrente": bool(paq.get("es_recurrente"))}
+  base = {"customer": customer, "ephemeral_key": _ephemeral_key(customer), "monto": c["monto_hoy"],
+          "recurrente": bool(paq.get("es_recurrente")),
+          "promocion": ({"texto": c["promo"]["texto"], "precio_original": c["promo"]["precio_original"],
+                         "precio_final": c["promo"]["precio_final"], "duracion": c["promo"]["duracion"],
+                         "meses": c["promo"].get("meses")} if c.get("promo") else None)}
 
   if not paq.get("es_recurrente"):
     pi = stripe.PaymentIntent.create(
@@ -449,6 +454,10 @@ def crear_link_pago(paquete_id: str, sucursal_id: str, staff_id: str | None) -> 
   if monto <= 0:
     raise ValueError("El paquete no tiene precio en esta sucursal")
   rec  = bool(paq.get("es_recurrente"))
+  # En un link no se puede programar "primer mes con descuento": solo aplica si es de pago único o "para siempre"
+  promo = promos.mejor_promocion(None, "paquete", paquete_id, sucursal_id, monto, recurrente=rec)
+  if promo and (not rec or promo["duracion"] == "siempre"):
+    monto = promo["precio_final"]
   meta = _meta({"tipo": "link_nuevo", "paquete_id": paquete_id, "sucursal_id": sucursal_id,
                 "staff_id": staff_id, "monto": monto})
   desc = f"{paq['nombre']} — Navy Training Center"
