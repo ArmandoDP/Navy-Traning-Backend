@@ -328,6 +328,9 @@ def _preparar_compra(cliente_id: str, paquete_id: str, sucursal_id: str | None, 
   if not cli:
     raise ValueError("Cliente no encontrado")
   suc   = sucursal_id or cli.get("sucursal_id")
+  if sucursal_id and not cli.get("sucursal_id"):
+    # Clientes que se registraron sin sucursal: se queda la que eligieron al comprar
+    supabase.table("clientes").update({"sucursal_id": sucursal_id}).eq("id", cliente_id).execute()
   monto = precio_paquete(paq, suc)
   memb  = membresia_activa(cliente_id)
   if paq.get("es_recurrente") and memb and memb.get("paquete_id") == paquete_id and memb.get("precio_pagado"):
