@@ -39,7 +39,8 @@ def calcular(cliente: dict, membresias: list[dict], hoy: str | None = None) -> d
   planes = [m for m in validas if not _es_clase_suelta(m)]
 
   vigentes = [m for m in planes
-              if m.get("estatus") in ("Activa", "Pausada") and (m.get("activacion_pendiente") or (m.get("fecha_fin") or "") >= hoy)]
+              if m.get("estatus") in ("Activa", "Pausada")
+              and (m.get("activacion_pendiente") or not m.get("fecha_fin") or (m.get("fecha_fin") or "") >= hoy)]
   if vigentes:
     vigentes.sort(key=lambda m: (
       _es_migracion(m),                                   # el que pagó antes que el de la carga masiva
