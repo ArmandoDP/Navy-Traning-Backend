@@ -29,6 +29,20 @@ load_dotenv()
 
 app = FastAPI(title="Navy Backend")
 
+# Si algo truena, se responde con el error real (y con CORS, porque este atrapador va DENTRO del CORS):
+# así el CRM y la app ven qué pasó en lugar de un "Load failed" / "Failed to fetch".
+from fastapi.responses import JSONResponse
+import traceback
+
+@app.middleware("http")
+async def atrapar_errores(request, call_next):
+  try:
+    return await call_next(request)
+  except Exception as e:
+    print(f"💥 {request.method} {request.url.path}: {e}")
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": f"Error del servidor: {str(e)[:200]}"})
+
 app.add_middleware(
   CORSMiddleware,
   allow_origins=[

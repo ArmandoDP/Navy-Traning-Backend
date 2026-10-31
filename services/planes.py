@@ -1,6 +1,5 @@
 # services/planes.py — cada hora: cierra los planes que terminaron (por fecha o por clases)
 # y hace entrar al siguiente de la fila. La regla vive en la base (función avanzar_planes).
-#
 from services.supabase import supabase
 
 
