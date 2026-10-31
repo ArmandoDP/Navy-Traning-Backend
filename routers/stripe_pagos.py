@@ -177,11 +177,14 @@ async def eliminar_metodo(cliente_id: str, payment_method_id: str, request: Requ
 # ─── Cobro a tarjeta guardada desde el CRM (The Galley y otros) ──────────────
 @router.post("/cobrar-tarjeta")
 async def cobrar_tarjeta(request: Request):
+  """Cobra a la tarjeta guardada del cliente (The Galley y cargos directos).
+  Regla: si Stripe cobró, el pago QUEDA registrado pase lo que pase, y la venta se marca Completada aquí mismo."""
   staff = staff_de_sesion(request)
   b = await request.json()
   cliente_id = b.get("cliente_id")
   monto      = float(b.get("monto") or 0)
   concepto   = b.get("concepto") or "Compra The Galley"
+  venta_id   = b.get("venta_id")
   if not cliente_id or monto <= 0:
     raise HTTPException(status_code=400, detail="cliente_id y monto son requeridos")
 
@@ -189,42 +192,68 @@ async def cobrar_tarjeta(request: Request):
   if not cli:
     raise HTTPException(status_code=404, detail="Cliente no encontrado")
   sucursal_id = b.get("sucursal_id") or cli.get("sucursal_id")
-
-  res = ss.cobrar_tarjeta_guardada(cliente_id, monto, concepto,
-    {"tipo": "cargo_directo", "cliente_id": cliente_id, "staff_id": staff.get("id"),
-     "venta_id": b.get("venta_id"), "concepto": concepto})
-
-  fila_pago = supabase.table("pagos").insert({
-    "cliente_id":               cliente_id,
-    "sucursal_id":              sucursal_id,
-    "monto":                    monto,
-    "estatus":                  "Completado" if res.get("ok") else "Fallido",
-    "metodo_pago":              res.get("metodo") or "Tarjeta guardada",
-    "canal":                    "Stripe",
-    "concepto":                 concepto,
-    "fecha_pago":               datetime.now(CDMX).isoformat(),
-    "stripe_payment_intent_id": res.get("payment_intent_id"),
-    "receipt_url":              res.get("receipt_url"),
-    "comision":                 res.get("comision"),
-    "metadata":                 {"venta_id": b.get("venta_id"), "staff_id": staff.get("id")},
-  }).execute().data
-  fila_pago = (fila_pago or [{}])[0]
-
   quien = " ".join(f"{staff.get('nombre') or ''} {staff.get('primer_apellido') or ''}".split())
-  supabase.table("actividad_log").insert({
-    "tipo":        "cargo_tarjeta" if res.get("ok") else "cargo_tarjeta_fallido",
-    "descripcion": f"{quien} {'cobró' if res.get('ok') else 'intentó cobrar'} ${monto:,.2f} a {cli['nombre_completo']} ({concepto})",
-    "tabla":       "pagos",
-    "accion":      "INSERT",
-    "metadata":    {"cliente_id": cliente_id, "monto": monto, "concepto": concepto,
-                    "metodo": res.get("metodo"), "error": res.get("mensaje")},
-    "sucursal_id": sucursal_id,
-    "staff_id":    staff.get("id"),
-  }).execute()
+
+  # 1. Cobrar. Un error de Stripe aquí significa que NO se cobró (tarjeta vencida, sin tarjeta, etc.)
+  try:
+    res = ss.cobrar_tarjeta_guardada(cliente_id, monto, concepto,
+      {"tipo": "cargo_directo", "cliente_id": cliente_id, "staff_id": staff.get("id"),
+       "venta_id": venta_id, "concepto": concepto})
+  except stripe.error.StripeError as e:
+    raise HTTPException(status_code=402, detail=getattr(e, "user_message", None) or str(e) or "La tarjeta no se pudo cobrar")
+  res = res or {}
+
+  # 2. Registrar el pago. Si Stripe cobró, esto NO puede perderse.
+  fila_pago = {}
+  pago = {
+    "cliente_id": cliente_id, "sucursal_id": sucursal_id, "monto": monto,
+    "estatus": "Completado" if res.get("ok") else "Fallido",
+    "metodo_pago": res.get("metodo") or "Tarjeta guardada", "canal": "Stripe", "concepto": concepto,
+    "fecha_pago": datetime.now(CDMX).isoformat(), "stripe_payment_intent_id": res.get("payment_intent_id"),
+    "metadata": {"venta_id": venta_id, "staff_id": staff.get("id")},
+  }
+  try:
+    fila_pago = (supabase.table("pagos").insert({**pago, "receipt_url": res.get("receipt_url"), "comision": res.get("comision")})
+                 .execute().data or [{}])[0]
+  except Exception as e1:
+    print(f"💥 cobrar-tarjeta: no se guardó el pago completo ({e1}); se intenta el registro sencillo")
+    try:
+      fila_pago = (supabase.table("pagos").insert(pago).execute().data or [{}])[0]
+    except Exception as e2:
+      print(f"💥💥 cobrar-tarjeta: PAGO SIN REGISTRAR · {res.get('payment_intent_id')} · {e2}")
+      try:
+        supabase.table("actividad_log").insert({
+          "tipo": "pago_sin_registrar", "tabla": "pagos", "accion": "INSERT", "sucursal_id": sucursal_id, "staff_id": staff.get("id"),
+          "descripcion": f"⚠️ Stripe {'cobró' if res.get('ok') else 'intentó cobrar'} ${monto:,.2f} a {cli['nombre_completo']} pero el pago no se pudo registrar: revisar",
+          "metadata": {"cliente_id": cliente_id, "monto": monto, "concepto": concepto, "venta_id": venta_id,
+                       "payment_intent_id": res.get("payment_intent_id"), "error": str(e2)[:300]},
+        }).execute()
+      except Exception:
+        pass
+
+  # 3. Actividad (si falla, no tumba el cobro)
+  try:
+    supabase.table("actividad_log").insert({
+      "tipo":        "cargo_tarjeta" if res.get("ok") else "cargo_tarjeta_fallido",
+      "descripcion": f"{quien} {'cobró' if res.get('ok') else 'intentó cobrar'} ${monto:,.2f} a {cli['nombre_completo']} ({concepto})",
+      "tabla": "pagos", "accion": "INSERT", "sucursal_id": sucursal_id, "staff_id": staff.get("id"),
+      "metadata": {"cliente_id": cliente_id, "monto": monto, "concepto": concepto, "venta_id": venta_id,
+                   "metodo": res.get("metodo"), "error": res.get("mensaje"), "payment_intent_id": res.get("payment_intent_id")},
+    }).execute()
+  except Exception as e:
+    print("cobrar-tarjeta actividad:", e)
 
   if not res.get("ok"):
     raise HTTPException(status_code=402, detail=res.get("mensaje") or "No se pudo cobrar")
 
+  # 4. La venta queda Completada aquí mismo (aunque el CRM pierda la respuesta por internet)
+  if venta_id:
+    try:
+      supabase.table("ventas").update({"estatus": "Completada"}).eq("id", venta_id).execute()
+    except Exception as e:
+      print("cobrar-tarjeta venta:", e)
+
+  # 5. Comprobante y notificación (si fallan, el cobro ya está hecho y registrado)
   try:
     await enviar_comprobante_compra(
       email=cli.get("email"), nombre=cli.get("nombre_completo"), monto=monto,
@@ -232,10 +261,13 @@ async def cobrar_tarjeta(request: Request):
     )
   except Exception as e:
     print("Error comprobante cargo directo:", e)
-  await push_cliente(cliente_id, "🧾 Compra registrada",
-    f"Se cobraron ${monto:,.2f} a tu {res.get('metodo')} por {concepto}. Te enviamos tu comprobante.",
-    {"tipo": "cargo_tarjeta", "pago_id": fila_pago.get("id")})
-  return {"ok": True, "metodo": res.get("metodo"), "receipt_url": res.get("receipt_url")}
+  try:
+    await push_cliente(cliente_id, "🧾 Compra registrada",
+      f"Se cobraron ${monto:,.2f} a tu {res.get('metodo')} por {concepto}. Te enviamos tu comprobante.",
+      {"tipo": "cargo_tarjeta", "pago_id": fila_pago.get("id")})
+  except Exception as e:
+    print("Push cargo directo:", e)
+  return {"ok": True, "metodo": res.get("metodo"), "receipt_url": res.get("receipt_url"), "registrado": bool(fila_pago.get("id"))}
 
 
 # ─── Links de pago para nuevos clientes (CRM) ────────────────────────────────
