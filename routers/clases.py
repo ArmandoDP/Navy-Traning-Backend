@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+import asyncio
 from fastapi import APIRouter, HTTPException, Request
 import httpx
 import os
@@ -145,8 +147,8 @@ def _aviso(origen: str | None) -> str:
 
 @router.get("/{clase_id}/cancelacion")
 async def vista_previa_cancelacion(clase_id: str, request: Request):
-    """Lo que va a pasar si se cancela: a quién se le avisa y cómo. Solo dirección."""
-    staff_de_sesion(request, roles=["direccion"])
+    """Lo que va a pasar si se cancela: a quién se le avisa y cómo. Dirección, gerentes y recepción."""
+    staff_de_sesion(request, roles=["direccion", "gerente", "staff_navy"])
     clase = _clase(clase_id)
     reservas = _reservas(clase_id)
     return {
@@ -162,11 +164,11 @@ async def vista_previa_cancelacion(clase_id: str, request: Request):
 
 @router.post("/cancelar")
 async def cancelar_clase(req: dict, request: Request):
-    """Cancela Y elimina la clase, todo junto. Solo dirección, escribiendo la frase de confirmación.
+    """Cancela Y elimina la clase, todo junto. Dirección, gerentes y recepción, escribiendo la frase de confirmación.
     1) la quita de Wellhub y TotalPass (si alguna falla, no se toca nada, salvo que se pida forzar) ·
     2) avisa a los clientes de Navy (correo + notificación) · 3) elimina la clase con todas sus reservas ·
     4) queda en el historial quién lo hizo y a quién se avisó."""
-    staff = staff_de_sesion(request, roles=["direccion"])
+    staff = staff_de_sesion(request, roles=["direccion", "gerente", "staff_navy"])
     clase_id = req.get("clase_id")
     if not clase_id:
         raise HTTPException(status_code=400, detail="clase_id requerido")
@@ -248,6 +250,114 @@ async def cancelar_clase(req: dict, request: Request):
 
     return {"ok": True, "clase_eliminada": clase_id, "reservas": len(reservas), "avisados_navy": avisados,
             "plataformas": len(reservas) - len(navy), "forzada": bool(problemas), "detalle": detalle}
+
+
+async def _quitar_de_plataformas(client: httpx.AsyncClient, clase: dict) -> list[str]:
+    """Quita la clase de Wellhub y TotalPass. Regresa la lista de problemas (vacía = todo bien)."""
+    problemas = []
+    slot, cls, gym = clase.get("wellhub_slot_id"), clase.get("wellhub_class_id"), WELLHUB_GYM_IDS.get(clase.get("sucursal_id"))
+    if slot and cls and gym:
+        try:
+            r = await client.delete(f"https://api.partners.gympass.com/booking/v1/gyms/{gym}/classes/{cls}/slots/{slot}",
+                                    headers={"Authorization": f"Bearer {os.getenv('WELLHUB_API_KEY')}", "Content-Type": "application/json"})
+            if r.status_code >= 400 and r.status_code != 404:
+                problemas.append(f"Wellhub {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            problemas.append(f"Wellhub: {e}")
+    occ, key = clase.get("totalpass_occurrence_uuid"), (clase.get("sucursales") or {}).get("totalpass_place_api_key")
+    if occ and key:
+        try:
+            auth = await client.post("https://booking-api.totalpass.com/partner/auth",
+                                     json={"partner_api_key": os.getenv("TOTALPASS_PARTNER_API_KEY"), "place_api_key": key})
+            token = auth.json().get("token")
+            r = await client.delete(f"https://booking-api.totalpass.com/partner/event-occurrence/{occ}",
+                                    headers={"Authorization": f"Bearer {token}", "accept": "application/json"}) if token else None
+            if r is None or (r.status_code >= 400 and r.status_code != 404):
+                problemas.append(f"TotalPass {getattr(r, 'status_code', 'sin acceso')}")
+        except Exception as e:
+            problemas.append(f"TotalPass: {e}")
+    return problemas
+
+
+def _grupos_duplicados(dias: int) -> list[list[dict]]:
+    """Clases activas repetidas (mismo nombre, sucursal y hora) en los próximos `dias` días."""
+    hasta = (datetime.now(timezone.utc) + timedelta(days=dias)).isoformat()
+    filas = supabase.table("clases").select(
+        "id, nombre_clase, horario, sucursal_id, room_id, coach_id, instructor, wellhub_slot_id, wellhub_class_id, "
+        "totalpass_occurrence_uuid, sucursales(nombre, totalpass_place_api_key), staff(nombre, primer_apellido), "
+        "reservas(id, cliente_id, origen, estatus, spot_id)"
+    ).eq("estado", "Activa").gte("horario", datetime.now(timezone.utc).isoformat()).lt("horario", hasta).execute().data or []
+    grupos: dict = {}
+    for c in filas:
+        c["reservas"] = [r for r in (c.get("reservas") or []) if r.get("estatus") not in ("Cancelada", "Cancelado")]
+        clave = (" ".join((c["nombre_clase"] or "").upper().split()), c["sucursal_id"], c["horario"])
+        grupos.setdefault(clave, []).append(c)
+    return [g for g in grupos.values() if len(g) > 1]
+
+
+def _plan_grupo(g: list[dict]) -> dict:
+    """Se queda la que tiene más gente; empate: la que está publicada en más plataformas."""
+    g = sorted(g, key=lambda c: (len(c["reservas"]), bool(c.get("wellhub_slot_id")) + bool(c.get("totalpass_occurrence_uuid"))), reverse=True)
+    queda, sobran = g[0], g[1:]
+    en_queda = {r["cliente_id"] for r in queda["reservas"]}
+    lugares = {r.get("spot_id") for r in queda["reservas"] if r.get("spot_id")}
+    mover, perderian = [], []
+    for c in sobran:
+        for r in c["reservas"]:
+            if r["cliente_id"] in en_queda:
+                continue                                         # ya está también en la que se queda
+            if "wellhub" in (r.get("origen") or "").lower() or "totalpass" in (r.get("origen") or "").lower():
+                perderian.append({"reserva_id": r["id"], "cliente_id": r["cliente_id"], "origen": r.get("origen")})
+            else:
+                spot = r.get("spot_id") if r.get("spot_id") not in lugares else None
+                if spot: lugares.add(spot)
+                mover.append({"reserva_id": r["id"], "spot_id": spot, "cambio_lugar": bool(r.get("spot_id")) and not spot})
+    coach = lambda c: f"{(c.get('staff') or {}).get('nombre') or c.get('instructor') or '—'}".strip()
+    return {
+        "clase": (queda["nombre_clase"] or "").strip(), "sucursal": (queda.get("sucursales") or {}).get("nombre"),
+        "horario": queda["horario"],
+        "se_queda": {"id": queda["id"], "coach": coach(queda), "reservas": len(queda["reservas"])},
+        "se_eliminan": [{"id": c["id"], "coach": coach(c), "reservas": len(c["reservas"])} for c in sobran],
+        "mover": mover, "perderian_su_lugar_en_plataforma": perderian, "_sobran": sobran, "_queda": queda,
+    }
+
+
+@router.get("/duplicados")
+async def ver_duplicados(request: Request, dias: int = 14):
+    """Vista previa: qué clases están repetidas y qué se haría con cada una. No cambia nada."""
+    staff_de_sesion(request, roles=["direccion"])
+    planes = [_plan_grupo(g) for g in _grupos_duplicados(dias)]
+    return {"grupos": len(planes), "detalle": [{k: v for k, v in p.items() if not k.startswith("_")} for p in planes]}
+
+
+@router.post("/limpiar-duplicados")
+async def limpiar_duplicados(req: dict, request: Request):
+    """Junta a la gente en una sola clase y elimina las repetidas del CRM, Wellhub y TotalPass. Solo dirección."""
+    staff = staff_de_sesion(request, roles=["direccion"])
+    if (req.get("confirmacion") or "").strip().upper() != "LIMPIAR DUPLICADOS":
+        raise HTTPException(status_code=400, detail='Para limpiar, manda confirmacion = "LIMPIAR DUPLICADOS".')
+    quien = f"{staff.get('nombre') or ''} {staff.get('primer_apellido') or ''}".strip() or "Dirección"
+    resultado = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for g in _grupos_duplicados(int(req.get("dias") or 14)):
+            p = _plan_grupo(g)
+            # 1. Mover a la gente de la app / CRM a la clase que se queda
+            for m in p["mover"]:
+                supabase.table("reservas").update({"clase_id": p["_queda"]["id"], "spot_id": m["spot_id"]}).eq("id", m["reserva_id"]).execute()
+            # 2. Quitar cada repetida de las plataformas y del CRM
+            for c in p["_sobran"]:
+                problemas = await _quitar_de_plataformas(client, c)
+                supabase.rpc("eliminar_clase", {"p_clase": c["id"], "p_quien": quien,
+                    "p_resumen": f"Clase repetida: se juntó con la de {p['se_queda']['coach']} ({len(p['mover'])} reservas movidas)"
+                                 + (f". Revisar plataforma: {' · '.join(problemas)}" if problemas else "")}).execute()
+                resultado.append({"clase": p["clase"], "horario": p["horario"], "eliminada": c["id"], "problemas": problemas})
+            await asyncio.sleep(1)
+    try:
+        supabase.table("actividad_log").insert({"tipo": "limpiar_duplicados", "tabla": "clases", "accion": "DELETE", "staff_id": staff.get("id"),
+            "descripcion": f"{quien} limpió {len(resultado)} clases repetidas", "metadata": {"resultado": resultado}}).execute()
+    except Exception:
+        pass
+    return {"ok": True, "eliminadas": len(resultado), "detalle": resultado}
 
 
 @router.post("/eliminar-totalpass")

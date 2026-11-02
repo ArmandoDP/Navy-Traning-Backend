@@ -42,7 +42,7 @@ async def autorizar(request: Request) -> dict:
   if not st.data:
     raise HTTPException(status_code=403, detail="Usuario no es staff")
   s = st.data[0]
-  if s.get("rol") != "direccion" or s.get("estatus") != "Activo":
+  if s.get("rol") not in ("direccion", "gerente") or s.get("estatus") != "Activo":
     raise HTTPException(status_code=403, detail="Solo dirección puede editar clases")
   return s
 
