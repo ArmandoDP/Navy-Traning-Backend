@@ -360,6 +360,53 @@ async def limpiar_duplicados(req: dict, request: Request):
     return {"ok": True, "eliminadas": len(resultado), "detalle": resultado}
 
 
+@router.post("/cancelar-reserva")
+async def cancelar_reserva_recepcion(req: dict, request: Request):
+    """Recepción cancela la reserva de un cliente que lo pide en sucursal, a cualquier hora y sin penalización.
+    Se le regresa su clase (es una cancelación de Navy, no tardía del cliente). Wellhub/TotalPass: desde su app."""
+    staff = staff_de_sesion(request, roles=["direccion", "gerente", "staff_navy"])
+    rid = req.get("reserva_id")
+    if not rid:
+        raise HTTPException(status_code=400, detail="reserva_id requerido")
+    r = supabase.table("reservas").select(
+        "id, estatus, origen, cliente_id, clase_id, clientes(nombre_completo), "
+        "clases(nombre_clase, horario, sucursal_id, sucursales(nombre))"
+    ).eq("id", rid).limit(1).execute().data
+    if not r:
+        raise HTTPException(status_code=404, detail="Reserva no encontrada")
+    r = r[0]
+    if r["estatus"] in ("Cancelada", "Cancelado"):
+        return {"ok": True, "ya_estaba": True}
+    origen = (r.get("origen") or "").lower()
+    if "wellhub" in origen or "totalpass" in origen:
+        raise HTTPException(status_code=400, detail=f"Esta reserva es de {r.get('origen')}: el cliente la cancela desde la app de {r.get('origen')}.")
+
+    supabase.table("reservas").update({"estatus": "Cancelada", "clase_consumida": False}).eq("id", rid).execute()
+
+    clase = r.get("clases") or {}
+    nombre = (clase.get("nombre_clase") or "").strip()
+    quien = f"{staff.get('nombre') or ''} {staff.get('primer_apellido') or ''}".strip() or "Recepción"
+    cliente = (r.get("clientes") or {}).get("nombre_completo") or "Cliente"
+    try:
+        supabase.table("actividad_log").insert({
+            "tipo": "reserva_cancelada_recepcion", "tabla": "reservas", "accion": "UPDATE", "staff_id": staff.get("id"),
+            "sucursal_id": clase.get("sucursal_id"),
+            "descripcion": f"{quien} canceló la reserva de {cliente} en {nombre} ({fmt_fecha(clase['horario'])} {fmt_hora(clase['horario'])}) a petición del cliente",
+            "metadata": {"reserva_id": rid, "clase_id": r["clase_id"], "cliente_id": r["cliente_id"], "motivo": req.get("motivo") or "Lo pidió en sucursal"},
+        }).execute()
+    except Exception as e:
+        print("cancelar-reserva actividad:", e)
+    try:
+        tokens = [t["token"] for t in supabase.table("push_tokens").select("token").eq("cliente_id", r["cliente_id"]).execute().data or []]
+        if tokens and clase.get("horario"):
+            await enviar_push(tokens, titulo="Reserva cancelada",
+                              cuerpo=f"Cancelamos tu reserva de {nombre} del {fmt_fecha(clase['horario'])} a las {fmt_hora(clase['horario'])}, como lo pediste. Tu clase quedó de regreso en tu plan.",
+                              data={"tipo": "reserva_cancelada", "clase_id": r["clase_id"]})
+    except Exception as e:
+        print("cancelar-reserva push:", e)
+    return {"ok": True}
+
+
 @router.post("/eliminar-totalpass")
 async def eliminar_clase_totalpass(req: dict):
     occurrence_uuid = req.get("occurrence_uuid")
