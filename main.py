@@ -8,6 +8,7 @@ from routers import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.pausas import reanudar_pausas_vencidas
 from services.planes import avanzar_planes
+from routers import auth_publico
 from services.aviso_migracion import avisar_vencimientos_migracion
 from services.push import (
   check_recordatorios_clase,
@@ -54,6 +55,7 @@ app.add_middleware(
 )
 
 # Routers
+app.include_router(auth_publico.router, prefix="/auth", tags=["Login"])
 app.include_router(crons.router,             prefix="/crons")
 app.include_router(pagos.router,             prefix="/pagos")              # OrkestaPay (apagado)
 app.include_router(totalpass.router,         prefix="/totalpass")
