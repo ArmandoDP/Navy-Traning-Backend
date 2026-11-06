@@ -129,11 +129,16 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     raise ValueError(f"Cliente o paquete no encontrado ({cliente_id}, {paquete_id})")
   sucursal_id = sucursal_id or cliente.get("sucursal_id")
 
-  # Paquetes en cola: si tiene un plan activo, el nuevo arranca cuando termine
+  # Renovación automática (la misma suscripción): sigue por fecha, pegada al periodo anterior.
+  # Compra nueva: se crea "normal" y la base decide: si ya tiene un plan queda En fila; si no, pendiente
+  # hasta su primera reserva (regla: un plan activo a la vez y nada corre hasta la primera reserva).
   hoy   = hoy_cdmx()
   memb  = membresia_activa(cliente_id)
   tenia = bool(memb)
-  inicio = max(hoy, date.fromisoformat(memb["fecha_fin"])) if memb else hoy
+  if es_renovacion and memb and memb.get("fecha_fin"):
+    inicio = max(hoy, date.fromisoformat(memb["fecha_fin"]))
+  else:
+    inicio = hoy
   vigencia = paquete.get("vigencia_dias") or 30
   fin = fecha_fin_stripe if (fecha_fin_stripe and fecha_fin_stripe > inicio) else inicio + timedelta(days=vigencia)
 
@@ -161,7 +166,7 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
   fila_pago = (fila_pago or [{}])[0]
   pago_id = fila_pago.get("id")
 
-  supabase.table("membresias").insert({
+  fila_memb = supabase.table("membresias").insert({
     "cliente_id":             cliente_id,
     "paquete_id":             paquete_id,
     "fecha_inicio":           inicio.isoformat(),
@@ -170,9 +175,15 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     "precio_pagado":          monto,
     "origen":                 "Renovacion" if es_renovacion else ("CRM" if origen == "crm" else "App"),
     "stripe_subscription_id": subscription_id,
-  }).execute()
+    "sucursal_id":            sucursal_id,        # sucursal donde se compró (para el cambio de sucursal al empezar)
+  }).execute().data
+  fila_memb = (fila_memb or [{}])[0]
+  en_fila   = fila_memb.get("estatus") == "En fila"
+  pendiente = bool(fila_memb.get("activacion_pendiente"))
 
-  upd = {"estatus": "Activo", "fecha_venc_plan": fin.isoformat()}
+  upd = {"estatus": "Activo"}
+  if fila_memb.get("fecha_fin") and not en_fila and not pendiente:
+    upd["fecha_venc_plan"] = fila_memb["fecha_fin"]
   if not tenia:
     upd.update({"plan": paquete["nombre"], "paquete_id": paquete_id})
   if subscription_id:
@@ -188,16 +199,21 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     await push_cliente(cliente_id, "✅ Membresía renovada",
       f"Tu plan {paquete['nombre']} se renovó. Vigente hasta el {fin.strftime('%d/%m/%Y')}.",
       {"tipo": "renovacion_exitosa", "pago_id": pago_id})
-  elif inicio > hoy:
+  elif en_fila:
     await push_cliente(cliente_id, "🎉 ¡Pago confirmado!",
-      f"{nombre1}, tu {paquete['nombre']} arranca el {inicio.strftime('%d/%m/%Y')}, cuando termine tu plan actual.",
+      f"{nombre1}, tu {paquete['nombre']} quedó en fila: empieza cuando termine tu plan actual, con tu primera reserva.",
+      {"tipo": "pago_confirmado", "pago_id": pago_id})
+  elif pendiente:
+    await push_cliente(cliente_id, "🎉 ¡Pago confirmado!",
+      f"{nombre1}, tu {paquete['nombre']} está listo. Empieza a correr con tu primera reserva. ¡A entrenar!",
       {"tipo": "pago_confirmado", "pago_id": pago_id})
   else:
     await push_cliente(cliente_id, "🎉 ¡Pago confirmado!",
       f"{nombre1}, tu {paquete['nombre']} ya está activo. ¡A entrenar!",
       {"tipo": "pago_confirmado", "pago_id": pago_id})
 
-  print(f"💳 Paquete activado: {cliente.get('email')} | {paquete['nombre']} | {inicio} → {fin} | {metodo}")
+  print(f"💳 Paquete activado: {cliente.get('email')} | {paquete['nombre']} | "
+        f"{'en fila' if en_fila else 'pendiente de 1ª reserva' if pendiente else f'{inicio} → {fin}'} | {metodo}")
   from services.estado_clientes import sincronizar_cliente
   sincronizar_cliente(cliente_id)   # plan, vencimiento y estado en su ficha
   from services.tarjetas import actualizar_tarjeta
