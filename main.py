@@ -8,7 +8,7 @@ from routers import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.pausas import reanudar_pausas_vencidas
 from services.planes import avanzar_planes
-from routers import auth_publico
+from routers import auth_publico, plataformas
 from services.aviso_migracion import avisar_vencimientos_migracion
 from services.push import (
   check_recordatorios_clase,
@@ -76,6 +76,7 @@ app.include_router(lista_espera.router,      prefix="/lista-espera")       # lis
 app.include_router(mis_pagos.router,         prefix="/mis-pagos")          # historial, detalle, PDF y tarjeta
 app.include_router(clientes_admin.router,    prefix="/clientes-admin")     # eliminar y unir clientes (dirección)
 app.include_router(promociones.router,       prefix="/promociones")        # descuentos y promociones
+app.include_router(plataformas.router,       prefix="/plataformas")        # Wellhub y TotalPass por sucursal
 app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler (horas en UTC: CDMX = UTC-6)

@@ -117,10 +117,11 @@ async def enviar_correo_cancelacion(email: str, nombre: str, clase: dict, sucurs
 
 
 FRASE_CONFIRMACION = "CANCELAR CLASE"
-WELLHUB_GYM_IDS = {
-    "1b2032dc-f5da-40c6-8c4e-e227be14673b": "848637",  # Condesa Gym
-    "f8f798a8-d89b-4874-a53a-cdcb6325ad2a": "848638",  # Condesa Studio
-}
+from services.plataformas import wellhub_de   # el gym de Wellhub de cada sucursal, desde la base
+
+
+def _gym_wellhub(sucursal_id: str | None) -> str | None:
+    return (wellhub_de(sucursal_id) or {}).get("gym_id")
 
 
 def _clase(clase_id: str) -> dict:
@@ -183,7 +184,7 @@ async def cancelar_clase(req: dict, request: Request):
     # 1. Plataformas
     problemas = []
     async with httpx.AsyncClient(timeout=30.0) as client:
-        slot, cls, gym = clase.get("wellhub_slot_id"), clase.get("wellhub_class_id"), WELLHUB_GYM_IDS.get(clase.get("sucursal_id"))
+        slot, cls, gym = clase.get("wellhub_slot_id"), clase.get("wellhub_class_id"), _gym_wellhub(clase.get("sucursal_id"))
         if slot and cls and gym:
             try:
                 r = await client.delete(
@@ -255,7 +256,7 @@ async def cancelar_clase(req: dict, request: Request):
 async def _quitar_de_plataformas(client: httpx.AsyncClient, clase: dict) -> list[str]:
     """Quita la clase de Wellhub y TotalPass. Regresa la lista de problemas (vacía = todo bien)."""
     problemas = []
-    slot, cls, gym = clase.get("wellhub_slot_id"), clase.get("wellhub_class_id"), WELLHUB_GYM_IDS.get(clase.get("sucursal_id"))
+    slot, cls, gym = clase.get("wellhub_slot_id"), clase.get("wellhub_class_id"), _gym_wellhub(clase.get("sucursal_id"))
     if slot and cls and gym:
         try:
             r = await client.delete(f"https://api.partners.gympass.com/booking/v1/gyms/{gym}/classes/{cls}/slots/{slot}",
