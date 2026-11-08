@@ -124,3 +124,32 @@ async def configurar(sucursal_id: str, request: Request):
     tp = await _totalpass(client, suc)
   olvidar_cache()
   return {"sucursal": (suc.get("nombre") or "").strip(), "wellhub": wh, "totalpass": tp}
+
+
+# ── Diagnóstico de Wellhub: comparar un gym que funciona (Condesa) contra los nuevos ──
+RUTAS_DIAGNOSTICO = [
+  "/setup/v1/gyms/{gym}/webhooks",
+  "/booking/v1/gyms/{gym}/webhooks",
+  "/setup/v1/gyms/{gym}",
+  "/booking/v1/gyms/{gym}",
+  "/setup/v1/gyms/{gym}/integrations",
+  "/booking/v1/gyms/{gym}/products",
+]
+
+
+@router.get("/wellhub/diagnostico")
+async def wellhub_diagnostico(request: Request, gyms: str = "848638,522244,553342,434452"):
+  """Solo LEE: qué responde Wellhub para cada gym en las rutas de configuración (webhooks, integración, productos)."""
+  staff_de_sesion(request, roles=["direccion"])
+  salida = {}
+  async with httpx.AsyncClient(timeout=20.0) as client:
+    for gym in [g.strip() for g in gyms.split(",") if g.strip()]:
+      salida[gym] = {}
+      for ruta in RUTAS_DIAGNOSTICO:
+        url = WELLHUB + ruta.format(gym=gym)
+        try:
+          r = await client.get(url, headers=_wh_headers())
+          salida[gym][ruta.replace("{gym}", gym)] = {"status": r.status_code, "respuesta": r.text[:700]}
+        except Exception as e:
+          salida[gym][ruta.replace("{gym}", gym)] = {"error": str(e)[:200]}
+  return salida
