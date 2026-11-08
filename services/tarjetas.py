@@ -3,11 +3,13 @@ from datetime import datetime, timedelta, timezone
 import stripe
 from services.supabase import supabase
 from services import stripe_service as ss
+from services.stripe_cuentas import con_cuenta, cuenta_de_cliente
 
 CDMX = timezone(timedelta(hours=-6))
 BILLETERAS = {"apple_pay": "Apple Pay", "google_pay": "Google Pay"}
 
 
+@con_cuenta(lambda cliente_id: cuenta_de_cliente(cliente_id))   # la de la cuenta de su sucursal
 def tarjeta_de(cliente_id: str) -> dict | None:
   """La tarjeta principal del cliente en Stripe (o None)."""
   cus = ss._customer_existente(cliente_id)

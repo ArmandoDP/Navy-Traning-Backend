@@ -8,12 +8,14 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 from services.supabase import supabase
 from services.auth_app import staff_de_sesion, autorizar_cliente
 from services import stripe_service as ss
+from services.stripe_cuentas import con_cuenta, fijar_cuenta, usar_cuenta, cuenta_actual, cuenta_de_cliente, cuenta_de_suscripcion
 from services.stripe_activacion import _uno, CDMX, activar_paquete, push_cliente, correo_simple
 
 router = APIRouter()
 BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://navy-traning-backend-production.up.railway.app")
 
 
+@con_cuenta(lambda cliente_id: cuenta_de_cliente(cliente_id))   # la tarjeta de su cuenta
 def _tarjeta(cliente_id: str) -> dict | None:
   cus = ss._customer_existente(cliente_id)
   pm_id = ss.tarjeta_principal(cus) if cus else None
@@ -80,6 +82,7 @@ async def paquete_tarjeta(request: Request):
   cli = _uno("clientes", "id, nombre_completo, email, sucursal_id", id=cliente_id)
   if not cli or not paquete_id:
     raise HTTPException(status_code=400, detail="Faltan el cliente o el paquete")
+  fijar_cuenta(cuenta_de_cliente(cliente_id))     # se cobra en la cuenta de Stripe de su sucursal
   tarjeta = _tarjeta(cliente_id)
   if not tarjeta:
     raise HTTPException(status_code=400, detail="El cliente no tiene tarjeta guardada. Envíale el cobro a su app.")
@@ -101,11 +104,11 @@ async def paquete_tarjeta(request: Request):
     except stripe.error.CardError as e:
       raise HTTPException(status_code=402, detail=(e.user_message or "La tarjeta fue rechazada") +
                           ". Puedes enviarle el cobro a su app para que pague con otra tarjeta.")
-    supabase.table("clientes").update({"stripe_subscription_id": sub.id}).eq("id", cliente_id).execute()
+    supabase.table("clientes").update({"stripe_subscription_id": sub.id, "stripe_subscription_cuenta": cuenta_actual()}).eq("id", cliente_id).execute()
     if inicio:
       fecha = datetime.fromtimestamp(inicio, CDMX).strftime("%d/%m/%Y")
       if memb:
-        supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False})\
+        supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False, "stripe_cuenta": cuenta_actual()})\
           .eq("id", memb["id"]).execute()
       await push_cliente(cliente_id, "🔄 Renovación activada",
         f"Tu {paq['nombre']} se cobrará a tu {etiqueta} el {fecha}, cuando termine tu plan actual.",
@@ -269,7 +272,8 @@ async def renovacion(membresia_id: str, request: Request):
   if sub_id:
     try:
       # cancel_at_period_end: no se cancela de golpe; deja de cobrar al terminar el periodo pagado
-      stripe.Subscription.modify(sub_id, cancel_at_period_end=cancelar)
+      with usar_cuenta(cuenta_de_suscripcion(sub_id)):
+        stripe.Subscription.modify(sub_id, cancel_at_period_end=cancelar)
       en_stripe = True
     except stripe.error.InvalidRequestError as e:
       print(f"renovación {sub_id}:", e.user_message or e)

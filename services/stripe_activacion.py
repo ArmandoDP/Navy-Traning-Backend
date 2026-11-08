@@ -4,6 +4,7 @@
 import os
 import httpx
 from datetime import date, datetime, timedelta, timezone
+from services.stripe_cuentas import PRINCIPAL, cuenta_actual, guardar_customer
 from services.supabase import supabase
 from services.push     import enviar_push
 
@@ -158,6 +159,7 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     "receipt_url":                receipt_url,
     "comision":                   comision,
     "metadata":                   {"origen": origen, "paquete_id": paquete_id, "subscription_id": subscription_id},
+    "stripe_cuenta":              cuenta_actual(),     # en qué cuenta de Stripe quedó (para reembolsos)
   }
   if pago_previo:  # OXXO que ya estaba pendiente
     fila_pago = supabase.table("pagos").update(pago).eq("id", pago_previo["id"]).execute().data
@@ -176,6 +178,7 @@ async def activar_paquete(*, cliente_id: str, paquete_id: str, monto: float, suc
     "origen":                 "Renovacion" if es_renovacion else ("CRM" if origen == "crm" else "App"),
     "stripe_subscription_id": subscription_id,
     "sucursal_id":            sucursal_id,        # sucursal donde se compró (para el cambio de sucursal al empezar)
+    "stripe_cuenta":          cuenta_actual(),    # en qué cuenta de Stripe vive su suscripción
   }).execute().data
   fila_memb = (fila_memb or [{}])[0]
   en_fila   = fila_memb.get("estatus") == "En fila"
@@ -306,11 +309,14 @@ async def asegurar_cliente(*, email: str | None, nombre: str | None, telefono: s
 
   r = supabase.table("clientes").select("id, nombre_completo, stripe_customer_id, supabase_user_id")\
     .ilike("email", email).limit(1).execute()
+  en_principal = cuenta_actual() == PRINCIPAL
   if r.data:
     c = r.data[0]
     upd = {}
-    if stripe_customer_id and not c.get("stripe_customer_id"):
+    if stripe_customer_id and en_principal and not c.get("stripe_customer_id"):
       upd["stripe_customer_id"] = stripe_customer_id
+    elif stripe_customer_id and not en_principal:
+      guardar_customer(c["id"], stripe_customer_id)
     if nombre and (c.get("nombre_completo") or "") in ("", provisional):
       upd["nombre_completo"] = nombre
     if upd:
@@ -328,9 +334,11 @@ async def asegurar_cliente(*, email: str | None, nombre: str | None, telefono: s
       "estatus":             "Activo",
       "origen":              "Link de pago",
       "fecha_alta_original": hoy_cdmx().isoformat(),
-      "stripe_customer_id":  stripe_customer_id,
+      "stripe_customer_id":  stripe_customer_id if en_principal else None,
     }).execute()
     cliente_id = nuevo.data[0]["id"]
+    if stripe_customer_id and not en_principal:
+      guardar_customer(cliente_id, stripe_customer_id)
   except Exception:
     # Otro evento lo creó al mismo tiempo
     r = supabase.table("clientes").select("id").ilike("email", email).limit(1).execute()

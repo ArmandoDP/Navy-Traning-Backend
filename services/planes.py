@@ -5,22 +5,24 @@ import os
 import stripe
 from datetime import datetime, timezone
 from services.supabase import supabase
+from services import stripe_service  # noqa: F401  (configura Stripe)
+from services.stripe_cuentas import usar_cuenta
 
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 
 def _no_renovar_reemplazados() -> int:
-  pendientes = supabase.table("membresias").select("id, stripe_subscription_id, notas") \
+  pendientes = supabase.table("membresias").select("id, stripe_subscription_id, stripe_cuenta, notas") \
     .eq("cancelar_renovacion", True).is_("renovacion_cancelada_at", "null").limit(200).execute().data or []
   hechos = 0
   for m in pendientes:
     sub_id = m.get("stripe_subscription_id")
     try:
       if sub_id:
-        sub = stripe.Subscription.retrieve(sub_id)
-        if sub.status in ("active", "trialing", "past_due") and not sub.cancel_at_period_end:
-          stripe.Subscription.modify(sub_id, cancel_at_period_end=True,
-                                     metadata={**(sub.metadata or {}), "no_renovar": "lo reemplazó un plan nuevo"})
+        with usar_cuenta(m.get("stripe_cuenta")):
+          sub = stripe.Subscription.retrieve(sub_id)
+          if sub.status in ("active", "trialing", "past_due") and not sub.cancel_at_period_end:
+            stripe.Subscription.modify(sub_id, cancel_at_period_end=True,
+                                       metadata={**(sub.metadata or {}), "no_renovar": "lo reemplazó un plan nuevo"})
       supabase.table("membresias").update({
         "cancelar_renovacion": False,
         "renovacion_cancelada_at": datetime.now(timezone.utc).isoformat(),

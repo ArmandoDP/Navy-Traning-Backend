@@ -2,6 +2,10 @@
 # Todo lo que habla con la API de Stripe.
 import os
 import stripe
+from services.stripe_cuentas import (   # una cuenta de Stripe por sucursal (debe ir antes de usar stripe)
+  PRINCIPAL, con_cuenta, cuenta_actual, cuenta_de_sucursal, cuenta_de_cliente,
+  customer_guardado, guardar_customer, publicable,
+)
 from services import promociones as promos
 from datetime import date, datetime, timedelta, timezone
 from services.supabase          import supabase
@@ -11,6 +15,29 @@ stripe.api_key     = os.getenv("STRIPE_SECRET_KEY")
 stripe.api_version = "2024-06-20"   # fijo para que los campos no cambien con versiones nuevas
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://crm.navytrainingcenter.com")
+
+
+# ─── En qué cuenta de Stripe corre cada operación ───────────────────────────
+def _cuenta_compra(cliente_id, paquete_id=None, sucursal_id=None, *a, **k):
+  return cuenta_de_sucursal(sucursal_id) if sucursal_id else cuenta_de_cliente(cliente_id)
+
+def _cuenta_cliente(cliente_id, *a, **k):
+  return cuenta_de_cliente(cliente_id)
+
+def _cuenta_penalizacion(penalizacion_id, *a, **k):
+  pen = _uno("penalizaciones_noshow", "cliente_id", id=penalizacion_id) or {}
+  return cuenta_de_cliente(pen.get("cliente_id"))
+
+def _cuenta_cargo(cliente_id, monto=None, concepto=None, metadata=None, *a, **k):
+  suc = (metadata or {}).get("sucursal_id")
+  return cuenta_de_sucursal(suc) if suc else cuenta_de_cliente(cliente_id)
+
+def _cuenta_link_nuevo(paquete_id, sucursal_id=None, *a, **k):
+  return cuenta_de_sucursal(sucursal_id)
+
+def _cuenta_link(link_id, *a, **k):
+  fila = _uno("links_pago", "stripe_cuenta", id=link_id) or {}
+  return fila.get("stripe_cuenta") or PRINCIPAL
 
 
 def centavos(monto) -> int:
@@ -30,12 +57,14 @@ def _urls(origen: str) -> tuple[str, str]:
 
 # ─── Clientes y tarjetas ─────────────────────────────────────────────────────
 def get_or_create_customer(cliente_id: str) -> str:
-  c = _uno("clientes", "id, nombre_completo, email, telefono, stripe_customer_id", id=cliente_id)
+  """El cliente de Stripe de esta persona EN LA CUENTA EN CURSO (uno por cuenta)."""
+  c = _uno("clientes", "id, nombre_completo, email, telefono", id=cliente_id)
   if not c:
     raise ValueError("Cliente no encontrado")
-  if c.get("stripe_customer_id"):
+  guardado = customer_guardado(cliente_id)
+  if guardado:
     try:
-      cus = stripe.Customer.retrieve(c["stripe_customer_id"])
+      cus = stripe.Customer.retrieve(guardado)
       if not cus.get("deleted"):
         return cus.id
     except stripe.error.InvalidRequestError:
@@ -44,16 +73,16 @@ def get_or_create_customer(cliente_id: str) -> str:
     email=c.get("email"), name=c.get("nombre_completo"),
     phone=c.get("telefono") or None, metadata={"cliente_id": cliente_id},
   )
-  supabase.table("clientes").update({"stripe_customer_id": cus.id}).eq("id", cliente_id).execute()
+  guardar_customer(cliente_id, cus.id)
   return cus.id
 
 
 def _customer_existente(cliente_id: str):
-  c = _uno("clientes", "stripe_customer_id", id=cliente_id)
-  if not c or not c.get("stripe_customer_id"):
+  guardado = customer_guardado(cliente_id)
+  if not guardado:
     return None
   try:
-    cus = stripe.Customer.retrieve(c["stripe_customer_id"])
+    cus = stripe.Customer.retrieve(guardado)
     return None if cus.get("deleted") else cus
   except stripe.error.InvalidRequestError:
     return None
@@ -67,6 +96,7 @@ def tarjeta_principal(customer) -> str | None:
   return pms.data[0].id if pms.data else None
 
 
+@con_cuenta(_cuenta_cliente)
 def listar_tarjetas(cliente_id: str) -> list[dict]:
   cus = _customer_existente(cliente_id)
   if not cus:
@@ -91,6 +121,7 @@ def _verificar_duenio(cliente_id: str, pm_id: str):
   return cus, pm
 
 
+@con_cuenta(_cuenta_cliente)
 def hacer_principal(cliente_id: str, pm_id: str):
   cus, _ = _verificar_duenio(cliente_id, pm_id)
   stripe.Customer.modify(cus.id, invoice_settings={"default_payment_method": pm_id})
@@ -100,6 +131,7 @@ def hacer_principal(cliente_id: str, pm_id: str):
       stripe.Subscription.modify(sub.id, default_payment_method=pm_id)
 
 
+@con_cuenta(_cuenta_cliente)
 def eliminar_tarjeta(cliente_id: str, pm_id: str):
   _verificar_duenio(cliente_id, pm_id)
   stripe.PaymentMethod.detach(pm_id)
@@ -185,6 +217,7 @@ def _sesion_pago(base: dict, msi: bool = True):
   raise ultimo
 
 
+@con_cuenta(_cuenta_compra)
 def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str,
                      extra_meta: dict | None = None) -> dict:
   c = _preparar_compra(cliente_id, paquete_id, sucursal_id, origen)
@@ -216,10 +249,11 @@ def checkout_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, 
       payment_intent_data={"metadata": meta, "description": f"{paq['nombre']} — Navy Training Center"},
       success_url=ok_url, cancel_url=cancel_url, locale="es",
     ))
-  return {"url": s.url, "session_id": s.id, "monto": c["monto_hoy"], "recurrente": bool(paq.get("es_recurrente")),
+  return {"url": s.url, "session_id": s.id, "monto": c["monto_hoy"], "recurrente": bool(paq.get("es_recurrente")), "cuenta": cuenta_actual(),
           "promocion": c["promo"]["texto"] if c.get("promo") else None}
 
 
+@con_cuenta(_cuenta_penalizacion)
 def checkout_penalizacion(penalizacion_id: str, origen: str) -> dict:
   pen = _uno("penalizaciones_noshow", "id, cliente_id, monto, estatus", id=penalizacion_id)
   if not pen or pen.get("estatus") != "Pendiente":
@@ -237,6 +271,7 @@ def checkout_penalizacion(penalizacion_id: str, origen: str) -> dict:
   return {"url": s.url, "session_id": s.id, "monto": pen["monto"]}
 
 
+@con_cuenta(_cuenta_cliente)
 def checkout_agregar_tarjeta(cliente_id: str, origen: str) -> dict:
   customer = get_or_create_customer(cliente_id)
   ok_url, cancel_url = _urls(origen)
@@ -250,11 +285,13 @@ def checkout_agregar_tarjeta(cliente_id: str, origen: str) -> dict:
 
 
 # ─── Cobros directos a la tarjeta guardada ───────────────────────────────────
+@con_cuenta(_cuenta_cargo)
 def cobrar_tarjeta_guardada(cliente_id: str, monto: float, concepto: str, metadata: dict) -> dict:
   cus = _customer_existente(cliente_id)
   pm  = tarjeta_principal(cus) if cus else None
   if not pm:
-    return {"ok": False, "error": "sin_tarjeta", "mensaje": "El cliente no tiene tarjeta guardada"}
+    return {"ok": False, "error": "sin_tarjeta", "cuenta": cuenta_actual(),
+            "mensaje": "El cliente no tiene tarjeta guardada" + ("" if cuenta_actual() == PRINCIPAL else " en esta sucursal")}
   try:
     pi = stripe.PaymentIntent.create(
       amount=centavos(monto), currency="mxn", customer=cus.id, payment_method=pm,
@@ -269,6 +306,7 @@ def cobrar_tarjeta_guardada(cliente_id: str, monto: float, concepto: str, metada
   return {
     "ok":                pi.status == "succeeded",
     "estado":            pi.status,
+    "cuenta":            cuenta_actual(),
     "payment_intent_id": pi.id,
     "receipt_url":       ch.receipt_url if ch else None,
     "metodo":            etiqueta_metodo(ch),
@@ -277,6 +315,7 @@ def cobrar_tarjeta_guardada(cliente_id: str, monto: float, concepto: str, metada
   }
 
 
+@con_cuenta(_cuenta_penalizacion)
 async def cobrar_penalizacion_automatica(penalizacion_id: str) -> dict:
   pen = _uno("penalizaciones_noshow", "id, cliente_id, monto, estatus, clase_id, intentos_cobro", id=penalizacion_id)
   if not pen or pen.get("estatus") != "Pendiente":
@@ -368,10 +407,12 @@ def crear_suscripcion(customer: str, paq: dict, monto: float, meta: dict, **extr
   )
 
 
+@con_cuenta(_cuenta_compra)
 def hoja_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, origen: str) -> dict:
   c = _preparar_compra(cliente_id, paquete_id, sucursal_id, origen)
   paq, monto, customer, meta = c["paq"], c["monto"], c["customer"], c["meta"]
   base = {"customer": customer, "ephemeral_key": _ephemeral_key(customer), "monto": c["monto_hoy"],
+          "publishable_key": publicable(), "cuenta": cuenta_actual(),
           "recurrente": bool(paq.get("es_recurrente")),
           "promocion": ({"texto": c["promo"]["texto"], "precio_original": c["promo"]["precio_original"],
                          "precio_final": c["promo"]["precio_final"], "duracion": c["promo"]["duracion"],
@@ -410,6 +451,7 @@ def hoja_paquete(cliente_id: str, paquete_id: str, sucursal_id: str | None, orig
   return {**base, "payment_intent": pi.client_secret, "intent_id": pi.id}
 
 
+@con_cuenta(_cuenta_penalizacion)
 def hoja_penalizacion(penalizacion_id: str) -> dict:
   pen = _uno("penalizaciones_noshow", "id, cliente_id, monto, estatus", id=penalizacion_id)
   if not pen or pen.get("estatus") != "Pendiente":
@@ -423,9 +465,11 @@ def hoja_penalizacion(penalizacion_id: str) -> dict:
     description="Penalización No Show — Navy Training Center",
   )
   return {"customer": customer, "ephemeral_key": _ephemeral_key(customer),
-          "payment_intent": pi.client_secret, "intent_id": pi.id, "monto": pen["monto"]}
+          "payment_intent": pi.client_secret, "intent_id": pi.id, "monto": pen["monto"],
+          "publishable_key": publicable(), "cuenta": cuenta_actual()}
 
 
+@con_cuenta(_cuenta_cliente)
 def hoja_tarjeta(cliente_id: str) -> dict:
   customer = get_or_create_customer(cliente_id)
   si = stripe.SetupIntent.create(
@@ -433,7 +477,8 @@ def hoja_tarjeta(cliente_id: str) -> dict:
     metadata=_meta({"tipo": "setup", "cliente_id": cliente_id}),
   )
   return {"customer": customer, "ephemeral_key": _ephemeral_key(customer),
-          "setup_intent": si.client_secret, "intent_id": si.id}
+          "setup_intent": si.client_secret, "intent_id": si.id,
+          "publishable_key": publicable(), "cuenta": cuenta_actual()}
 
 
 # ─── Links de pago (nuevos clientes) ─────────────────────────────────────────
@@ -449,6 +494,7 @@ def _precio_stripe(paq: dict, monto: float, recurrente: bool) -> str:
   return stripe.Price.create(**kw).id
 
 
+@con_cuenta(_cuenta_link_nuevo)
 def crear_link_pago(paquete_id: str, sucursal_id: str, staff_id: str | None) -> dict:
   paq = _uno("paquetes", "id, nombre, precio, vigencia_dias, es_recurrente, estatus", id=paquete_id)
   if not paq or (paq.get("estatus") and paq["estatus"] != "Activo"):
@@ -489,10 +535,12 @@ def crear_link_pago(paquete_id: str, sucursal_id: str, staff_id: str | None) -> 
     "monto":                  monto,
     "recurrente":             rec,
     "creado_por":             staff_id,
+    "stripe_cuenta":          cuenta_actual(),
   }).execute().data[0]
   return {**fila, "paquete": paq["nombre"]}
 
 
+@con_cuenta(_cuenta_link)
 def desactivar_link(link_id: str):
   fila = _uno("links_pago", "id, stripe_payment_link_id", id=link_id)
   if not fila:

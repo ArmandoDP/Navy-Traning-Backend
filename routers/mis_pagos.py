@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 from services.supabase import supabase
 from services import stripe_service as ss
+from services.stripe_cuentas import fijar_cuenta, cuenta_actual, cuenta_de_cliente, customer_guardado
 from services.tarjetas import actualizar_tarjeta
 from services.comprobante_pdf import comprobante_pdf
 from routers.metas import _cliente
@@ -59,9 +60,10 @@ async def mis_pagos(request: Request):
 async def estado_tarjeta(request: Request):
   """Para los avisos de la app: ¿tiene tarjeta?, ¿cuándo vence su plan?, ¿puede activar renovación automática?"""
   cli = _cliente(request)
-  ficha = supabase.table("clientes").select("tarjeta_guardada, tarjeta_marca, tarjeta_ultimos4, created_at, stripe_customer_id")\
+  ficha = supabase.table("clientes").select("tarjeta_guardada, tarjeta_marca, tarjeta_ultimos4, created_at")\
     .eq("id", cli["id"]).single().execute().data
-  if ficha.get("stripe_customer_id") and not ficha.get("tarjeta_guardada"):
+  # Su cliente de Stripe en la cuenta de su sucursal (la principal si su sucursal no tiene cuenta activa)
+  if customer_guardado(cli["id"], cuenta_de_cliente(cli["id"])) and not ficha.get("tarjeta_guardada"):
     t = actualizar_tarjeta(cli["id"])                 # por si la agregó y la ficha no se había enterado
     if t:
       ficha.update({"tarjeta_guardada": True, "tarjeta_marca": t["marca"], "tarjeta_ultimos4": t["ultimos4"]})
@@ -93,6 +95,7 @@ async def activar_renovacion(request: Request):
     raise HTTPException(status_code=400, detail="Tu plan actual no tiene renovación automática.")
   memb = supabase.table("membresias").select("id, paquete_id").eq("cliente_id", cli["id"]).eq("estatus", "Activa")\
     .order("fecha_fin", desc=True).limit(1).execute().data[0]
+  fijar_cuenta(cuenta_de_cliente(cli["id"]))      # su tarjeta y su suscripción, en la cuenta de su sucursal
   try:
     c = ss._preparar_compra(cli["id"], memb["paquete_id"], None, "renovacion_app")
   except ValueError as e:
@@ -102,10 +105,13 @@ async def activar_renovacion(request: Request):
     raise HTTPException(status_code=400, detail="Tu plan termina muy pronto: renuévalo desde Comprar plan.")
   from services.tarjetas import tarjeta_de
   t = tarjeta_de(cli["id"])
+  if not t:
+    raise HTTPException(status_code=400, detail="Primero agrega tu tarjeta.")
   sub = ss.crear_suscripcion(c["customer"], c["paq"], c["monto"], c["meta"],
                              default_payment_method=t["id"], trial_end=inicio, payment_behavior="default_incomplete")
-  supabase.table("clientes").update({"stripe_subscription_id": sub.id}).eq("id", cli["id"]).execute()
-  supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False}).eq("id", memb["id"]).execute()
+  supabase.table("clientes").update({"stripe_subscription_id": sub.id, "stripe_subscription_cuenta": cuenta_actual()}).eq("id", cli["id"]).execute()
+  supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False,
+                                       "stripe_cuenta": cuenta_actual()}).eq("id", memb["id"]).execute()
   fecha = datetime.fromtimestamp(inicio, CDMX).strftime("%d/%m/%Y")
   return {"ok": True, "fecha": fecha, "monto": c["monto"], "plan": c["paq"]["nombre"]}
 

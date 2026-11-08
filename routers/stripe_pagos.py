@@ -7,6 +7,9 @@ from services.supabase   import supabase
 from services.auth_app   import autorizar_cliente, staff_de_sesion
 from services.email      import enviar_comprobante_compra
 from services import stripe_service as ss
+from services.stripe_cuentas import (
+  PRINCIPAL, CUENTAS, usar_cuenta, fijar_cuenta, cuenta_actual, secreto_webhook, recuperar_en_cuentas,
+)
 from services.stripe_activacion import (
   _uno, CDMX, activar_paquete, marcar_penalizacion_pagada, registrar_oxxo_pendiente,
   marcar_pago_fallido, push_cliente, correo_simple, membresia_activa, asegurar_cliente,
@@ -109,10 +112,11 @@ async def hoja_tarjeta(request: Request):
 
 
 @router.get("/pi/{intent_id}")
-async def estado_pago(intent_id: str):
-  """La app lo consulta después del formulario nativo."""
+async def estado_pago(intent_id: str, cuenta: str | None = None):
+  """La app lo consulta después del formulario nativo (con ?cuenta= si la sabe; si no, se busca)."""
   try:
-    pi = stripe.PaymentIntent.retrieve(intent_id)
+    pi, encontrada = recuperar_en_cuentas(stripe.PaymentIntent.retrieve, intent_id, cuenta=cuenta)
+    fijar_cuenta(encontrada)
   except stripe.error.InvalidRequestError:
     raise HTTPException(status_code=404, detail="Pago no encontrado")
   meta  = dict(pi.metadata or {})
@@ -198,7 +202,7 @@ async def cobrar_tarjeta(request: Request):
   try:
     res = ss.cobrar_tarjeta_guardada(cliente_id, monto, concepto,
       {"tipo": "cargo_directo", "cliente_id": cliente_id, "staff_id": staff.get("id"),
-       "venta_id": venta_id, "concepto": concepto})
+       "venta_id": venta_id, "concepto": concepto, "sucursal_id": sucursal_id})
   except stripe.error.StripeError as e:
     raise HTTPException(status_code=402, detail=getattr(e, "user_message", None) or str(e) or "La tarjeta no se pudo cobrar")
   res = res or {}
@@ -211,6 +215,7 @@ async def cobrar_tarjeta(request: Request):
     "metodo_pago": res.get("metodo") or "Tarjeta guardada", "canal": "Stripe", "concepto": concepto,
     "fecha_pago": datetime.now(CDMX).isoformat(), "stripe_payment_intent_id": res.get("payment_intent_id"),
     "metadata": {"venta_id": venta_id, "staff_id": staff.get("id")},
+    "stripe_cuenta": res.get("cuenta") or PRINCIPAL,
   }
   try:
     fila_pago = (supabase.table("pagos").insert({**pago, "receipt_url": res.get("receipt_url"), "comision": res.get("comision")})
@@ -317,9 +322,10 @@ async def desactivar_link(link_id: str, request: Request):
 
 # ─── Estado de un checkout (la app lo consulta al volver del pago) ──────────
 @router.get("/sesion/{session_id}")
-async def estado_sesion(session_id: str):
+async def estado_sesion(session_id: str, cuenta: str | None = None):
   try:
-    s = stripe.checkout.Session.retrieve(session_id, expand=["payment_intent"])
+    s, encontrada = recuperar_en_cuentas(stripe.checkout.Session.retrieve, session_id, expand=["payment_intent"], cuenta=cuenta)
+    fijar_cuenta(encontrada)
   except stripe.error.InvalidRequestError:
     raise HTTPException(status_code=404, detail="Sesión no encontrada")
   monto = (s.amount_total or 0) / 100
@@ -358,10 +364,26 @@ async def estado_sesion(session_id: str):
 # ─── Webhook: la única fuente de verdad ──────────────────────────────────────
 @router.post("/webhook")
 async def webhook(request: Request):
+  """Webhook de la cuenta principal (la de siempre)."""
+  return await _recibir(request, PRINCIPAL)
+
+
+@router.post("/webhook/{cuenta}")
+async def webhook_cuenta(cuenta: str, request: Request):
+  """Webhook de la cuenta de una sucursal: /stripe/webhook/interlomas-studio, /stripe/webhook/lomas, ..."""
+  cuenta = cuenta.strip().lower()
+  if cuenta not in CUENTAS:
+    raise HTTPException(status_code=404, detail="Cuenta desconocida")
+  if not secreto_webhook(cuenta):
+    raise HTTPException(status_code=503, detail=f"Falta STRIPE_WH_{CUENTAS[cuenta]} en el servidor")
+  with usar_cuenta(cuenta):           # todo lo que pase con este evento, en la cuenta de esa sucursal
+    return await _recibir(request, cuenta)
+
+
+async def _recibir(request: Request, cuenta: str):
   payload = await request.body()
   try:
-    event = stripe.Webhook.construct_event(
-      payload, request.headers.get("stripe-signature"), os.getenv("STRIPE_WEBHOOK_SECRET"))
+    event = stripe.Webhook.construct_event(payload, request.headers.get("stripe-signature"), secreto_webhook(cuenta))
   except Exception as e:
     raise HTTPException(status_code=400, detail=f"Firma inválida: {e}")
 
@@ -489,12 +511,12 @@ async def _suscripcion_creada(s, meta):
   cliente_id = meta.get("cliente_id")
   if not cliente_id:
     return
-  supabase.table("clientes").update({"stripe_subscription_id": sub.id}).eq("id", cliente_id).execute()
+  supabase.table("clientes").update({"stripe_subscription_id": sub.id, "stripe_subscription_cuenta": cuenta_actual()}).eq("id", cliente_id).execute()
   if sub.status == "trialing":
     # Ya tenía plan activo: la suscripción cubre la siguiente renovación
     memb = membresia_activa(cliente_id)
     if memb:
-      supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False})\
+      supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False, "stripe_cuenta": cuenta_actual()})\
         .eq("id", memb["id"]).execute()
     inicio = datetime.fromtimestamp(sub.trial_end, CDMX).strftime("%d/%m/%Y")
     await push_cliente(cliente_id, "🔄 ¡Listo! Renovación activada",
@@ -623,10 +645,10 @@ async def _setup_exitoso(si):
       {**{k: v for k, v in meta.items() if k not in ("tipo", "trial_end")}, "tipo": "paquete"},
       trial_end=int(meta["trial_end"]), default_payment_method=si.payment_method,
     )
-    supabase.table("clientes").update({"stripe_subscription_id": sub.id}).eq("id", cliente_id).execute()
+    supabase.table("clientes").update({"stripe_subscription_id": sub.id, "stripe_subscription_cuenta": cuenta_actual()}).eq("id", cliente_id).execute()
     memb = membresia_activa(cliente_id)
     if memb:
-      supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False})\
+      supabase.table("membresias").update({"stripe_subscription_id": sub.id, "renovacion_cancelada": False, "stripe_cuenta": cuenta_actual()})\
         .eq("id", memb["id"]).execute()
     inicio = datetime.fromtimestamp(int(meta["trial_end"]), CDMX).strftime("%d/%m/%Y")
     await push_cliente(cliente_id, "🔄 ¡Listo! Renovación activada",

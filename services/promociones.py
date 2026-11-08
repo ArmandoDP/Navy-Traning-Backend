@@ -4,6 +4,7 @@
 from datetime import datetime, timezone
 import stripe
 from services.supabase import supabase
+from services.stripe_cuentas import cuenta_actual
 
 MESES_TXT = {1: "el primer mes", 2: "los primeros 2 meses", 3: "los primeros 3 meses"}
 
@@ -95,7 +96,7 @@ def cupon_stripe(promo: dict, paquete_id: str) -> str | None:
   """Cupón de Stripe para renovaciones: una vez, N meses o para siempre. Se crea una vez y se reutiliza."""
   monto = promo["descuento"]
   ya = supabase.table("promocion_cupones_stripe").select("cupon_id").eq("promocion_id", promo["promocion_id"])\
-    .eq("paquete_id", paquete_id).eq("monto_desc", monto).limit(1).execute().data
+    .eq("paquete_id", paquete_id).eq("monto_desc", monto).eq("cuenta", cuenta_actual()).limit(1).execute().data
   if ya:
     return ya[0]["cupon_id"]
   dur = {"primera": {"duration": "once"}, "siempre": {"duration": "forever"},
@@ -103,7 +104,7 @@ def cupon_stripe(promo: dict, paquete_id: str) -> str | None:
   c = stripe.Coupon.create(amount_off=int(round(monto * 100)), currency="mxn", name=(promo.get("mensaje") or promo["nombre"])[:40],
                            metadata={"promocion_id": promo["promocion_id"], "paquete_id": paquete_id}, **dur)
   supabase.table("promocion_cupones_stripe").insert({"promocion_id": promo["promocion_id"], "paquete_id": paquete_id,
-                                                     "monto_desc": monto, "cupon_id": c.id}).execute()
+                                                     "monto_desc": monto, "cupon_id": c.id, "cuenta": cuenta_actual()}).execute()
   return c.id
 
 

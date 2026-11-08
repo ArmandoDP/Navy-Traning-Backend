@@ -6,6 +6,7 @@ import stripe
 from datetime import date, datetime, time, timedelta, timezone
 from services.supabase           import supabase
 from services                    import stripe_service  # noqa: F401  (configura la llave y versión de Stripe)
+from services.stripe_cuentas     import usar_cuenta
 from services.stripe_activacion  import push_cliente, CDMX, hoy_cdmx
 
 DIAS_MAX_ACTIVACION = int(os.getenv("DIAS_MAX_ACTIVACION", "30"))   # igual que navy_dias_max_activacion() en SQL
@@ -19,14 +20,15 @@ def _ts(fecha: str) -> int:
 
 # ─── 1. Que Stripe cobre la renovación hasta que termine el periodo real ─────
 async def sincronizar_stripe_membresias():
-  r = supabase.table("membresias").select("id, fecha_fin, stripe_subscription_id")\
+  r = supabase.table("membresias").select("id, fecha_fin, stripe_subscription_id, stripe_cuenta")\
     .eq("stripe_sincronizada", False).eq("estatus", "Activa")\
     .not_.is_("stripe_subscription_id", "null").limit(50).execute()
   for m in (r.data or []):
     fin = _ts(m["fecha_fin"])
     try:
       if fin > datetime.now(timezone.utc).timestamp() + 3600:
-        stripe.Subscription.modify(m["stripe_subscription_id"], trial_end=fin, proration_behavior="none")
+        with usar_cuenta(m.get("stripe_cuenta")):
+          stripe.Subscription.modify(m["stripe_subscription_id"], trial_end=fin, proration_behavior="none")
         print(f"🗓  Stripe: siguiente cobro de {m['stripe_subscription_id']} movido al {m['fecha_fin']}")
       supabase.table("membresias").update({"stripe_sincronizada": True}).eq("id", m["id"]).execute()
     except stripe.error.InvalidRequestError as e:

@@ -6,6 +6,7 @@ import stripe
 from fastapi import APIRouter, HTTPException, Request
 from services.supabase           import supabase
 from services                    import stripe_service  # noqa: F401  (configura Stripe)
+from services.stripe_cuentas     import usar_cuenta, cuenta_de_cliente, cuenta_de_suscripcion, customer_guardado, PRINCIPAL
 from services.auth_app           import staff_de_sesion
 from services.stripe_activacion  import push_cliente, hoy_cdmx
 
@@ -96,11 +97,20 @@ async def diagnostico(cliente_id: str, request: Request):
 
   # ── Stripe ──
   stripe_info = None
-  if c.get("stripe_customer_id"):
+  cuenta_cli = cuenta_de_cliente(cliente_id)            # la cuenta de Stripe de su sucursal
+  customer = _seguro(lambda: customer_guardado(cliente_id, cuenta_cli), None)
+  if customer or c.get("stripe_subscription_id"):
     def _st():
-      pms = stripe.PaymentMethod.list(customer=c["stripe_customer_id"], type="card", limit=5).data
-      sub = stripe.Subscription.retrieve(c["stripe_subscription_id"]) if c.get("stripe_subscription_id") else None
+      pms = []
+      if customer:
+        with usar_cuenta(cuenta_cli):
+          pms = stripe.PaymentMethod.list(customer=customer, type="card", limit=5).data
+      sub = None
+      if c.get("stripe_subscription_id"):
+        with usar_cuenta(cuenta_de_suscripcion(c["stripe_subscription_id"])):
+          sub = stripe.Subscription.retrieve(c["stripe_subscription_id"])
       return {
+        "cuenta": cuenta_cli,
         "tarjetas": [{"marca": p.card.brand, "ultimos4": p.card.last4, "vence": f"{p.card.exp_month:02d}/{p.card.exp_year}"} for p in pms],
         "suscripcion": {"estado": sub.status, "cancela_al_final": sub.cancel_at_period_end} if sub else None,
       }
