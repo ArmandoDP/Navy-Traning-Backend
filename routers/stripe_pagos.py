@@ -8,7 +8,7 @@ from services.auth_app   import autorizar_cliente, staff_de_sesion
 from services.email      import enviar_comprobante_compra
 from services import stripe_service as ss
 from services.stripe_cuentas import (
-  PRINCIPAL, CUENTAS, usar_cuenta, fijar_cuenta, cuenta_actual, secreto_webhook, recuperar_en_cuentas,
+  PRINCIPAL, CUENTAS, normal, usar_cuenta, fijar_cuenta, cuenta_actual, secreto_webhook, recuperar_en_cuentas,
 )
 from services.stripe_activacion import (
   _uno, CDMX, activar_paquete, marcar_penalizacion_pagada, registrar_oxxo_pendiente,
@@ -376,6 +376,7 @@ async def webhook_cuenta(cuenta: str, request: Request):
     raise HTTPException(status_code=404, detail="Cuenta desconocida")
   if not secreto_webhook(cuenta):
     raise HTTPException(status_code=503, detail=f"Falta STRIPE_WH_{CUENTAS[cuenta]} en el servidor")
+  cuenta = normal(cuenta)             # condesa = la cuenta de siempre
   with usar_cuenta(cuenta):           # todo lo que pase con este evento, en la cuenta de esa sucursal
     return await _recibir(request, cuenta)
 
