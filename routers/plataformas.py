@@ -153,3 +153,43 @@ async def wellhub_diagnostico(request: Request, gyms: str = "848638,522244,55334
         except Exception as e:
           salida[gym][ruta.replace("{gym}", gym)] = {"error": str(e)[:200]}
   return salida
+
+
+@router.get("/wellhub/clases")
+async def wellhub_clases(request: Request, por_sucursal: int = 2):
+  """Solo LEE: para cada sucursal en Wellhub, sus próximas clases publicadas, tal como las ve Wellhub."""
+  staff_de_sesion(request, roles=["direccion"])
+  from datetime import datetime, timezone
+  ahora = datetime.now(timezone.utc).isoformat()
+  sucs = supabase.table("sucursales").select("id, nombre").eq("estatus", "Activa").order("nombre").execute().data or []
+  salida = []
+  async with httpx.AsyncClient(timeout=20.0) as client:
+    for suc in sucs:
+      cfg = wellhub_de(suc["id"])
+      if not cfg:
+        continue
+      clases = supabase.table("clases").select("id, nombre_clase, horario, wellhub_class_id, wellhub_slot_id")\
+        .eq("sucursal_id", suc["id"]).eq("estado", "Activa").not_.is_("wellhub_slot_id", "null")\
+        .gte("horario", ahora).order("horario").limit(por_sucursal).execute().data or []
+      fila = {"sucursal": (suc.get("nombre") or "").strip(), "gym_id": cfg["gym_id"], "product_id_nuestro": cfg.get("product_id"), "clases": []}
+      for c in clases:
+        gym, cls, slot = cfg["gym_id"], c["wellhub_class_id"], c["wellhub_slot_id"]
+        info = {"clase": (c.get("nombre_clase") or "").strip(), "horario": c["horario"]}
+        r = await client.get(f"{WELLHUB}/booking/v1/gyms/{gym}/classes/{cls}", headers=_wh_headers())
+        info["clase_wellhub"] = {"status": r.status_code}
+        if r.status_code == 200:
+          d = r.json(); d = (d.get("classes") or [d])[0] if isinstance(d, dict) else d
+          info["clase_wellhub"].update({k: d.get(k) for k in ("name", "bookable", "visible", "product_id", "is_virtual")})
+        else:
+          info["clase_wellhub"]["respuesta"] = r.text[:200]
+        r = await client.get(f"{WELLHUB}/booking/v1/gyms/{gym}/classes/{cls}/slots/{slot}", headers=_wh_headers())
+        info["slot_wellhub"] = {"status": r.status_code}
+        if r.status_code == 200:
+          d = r.json(); d = (d.get("results") or [d])[0] if isinstance(d, dict) else d
+          info["slot_wellhub"].update({k: d.get(k) for k in ("occur_date", "status", "total_capacity", "total_booked",
+                                                              "product_id", "cancellable_until", "booking_window")})
+        else:
+          info["slot_wellhub"]["respuesta"] = r.text[:200]
+        fila["clases"].append(info)
+      salida.append(fila)
+  return salida
