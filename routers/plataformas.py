@@ -67,7 +67,7 @@ async def _totalpass(client: httpx.AsyncClient, suc: dict) -> dict:
   else:
     r = await client.get(f"{TP_BOOKING}/partner/plans", headers=h)
     datos = r.json() if r.status_code < 400 else {}
-    lista = datos if isinstance(datos, list) else (datos.get("data") or datos.get("plans") or [])
+    lista = datos if isinstance(datos, list) else (datos.get("Plans") or datos.get("plans") or datos.get("data") or [])
     planes = [{"id": p.get("id") or p.get("uuid"), "nombre": p.get("name") or p.get("title")} for p in lista if isinstance(p, dict)]
     if len(planes) == 1 and planes[0]["id"]:
       supabase.table("sucursales").update({"totalpass_plan_id": str(planes[0]["id"])}).eq("id", suc["id"]).execute()
