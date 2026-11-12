@@ -104,55 +104,8 @@ def _cambios(cliente: dict, nuevo: dict) -> dict:
   return cambios
 
 
-SEL_MEMB = "id, cliente_id, estatus, fecha_inicio, fecha_fin, activacion_pendiente, origen, precio_pagado, paquete_id, paquetes(nombre, clases_incluidas)"
+SEL_MEMB = "cliente_id, estatus, fecha_inicio, fecha_fin, activacion_pendiente, origen, precio_pagado, paquete_id, paquetes(nombre)"
 SEL_CLI  = "id, origen, estatus, plan, nombre_plan, paquete_id, fecha_venc_plan, perdido"
-
-
-def cerrar_agotadas(membs: list[dict]) -> int:
-  """Paquetes con número de clases (One Class, 8 clases…) cuyas clases ya se tomaron pasan a Vencida
-  sin esperar a su fecha_fin. Cuenta una clase como usada cuando la reserva no está cancelada Y la clase
-  ya ocurrió (una reserva a futuro no consume todavía: el cliente sigue Activo hasta que la tome).
-  Modifica las filas en memoria para que calcular() ya las vea vencidas."""
-  candidatas = {m["id"]: m for m in membs
-                if m.get("id") and m.get("estatus") == "Activa" and not m.get("activacion_pendiente")
-                and (m.get("paquetes") or {}).get("clases_incluidas")}
-  if not candidatas:
-    return 0
-  ahora = datetime.now(timezone.utc).isoformat()
-  usadas: dict[str, int] = {}
-  por_cliente: dict[str, list] = {}
-  for m in candidatas.values():
-    por_cliente.setdefault(m["cliente_id"], []).append(m)
-  clientes = list(por_cliente)
-  try:
-    for i in range(0, len(clientes), 100):
-      filas = supabase.table("reservas").select("cliente_id, membresia_id, clases!inner(horario)")\
-        .in_("cliente_id", clientes[i:i + 100]).neq("estatus", "Cancelada")\
-        .lt("clases.horario", ahora).execute().data or []
-      for f in filas:
-        if f.get("membresia_id"):                      # reserva ligada a su membresía
-          if f["membresia_id"] in candidatas:
-            usadas[f["membresia_id"]] = usadas.get(f["membresia_id"], 0) + 1
-          continue
-        # Reserva sin membresia_id: se asigna al paquete del cliente cuyo rango de fechas incluye la clase (hora CDMX)
-        dia = (datetime.fromisoformat(f["clases"]["horario"].replace("Z", "+00:00")).astimezone(CDMX)).date().isoformat()
-        for m in por_cliente.get(f["cliente_id"], []):
-          if (m.get("fecha_inicio") or "") <= dia <= (m.get("fecha_fin") or "9999-12-31")[:10]:
-            usadas[m["id"]] = usadas.get(m["id"], 0) + 1
-            break
-  except Exception as e:
-    print("estado_clientes agotadas:", e)
-    return 0
-  cerradas = 0
-  for mid, m in candidatas.items():
-    if usadas.get(mid, 0) >= m["paquetes"]["clases_incluidas"]:
-      try:
-        supabase.table("membresias").update({"estatus": "Vencida"}).eq("id", mid).execute()
-        m["estatus"] = "Vencida"
-        cerradas += 1
-      except Exception as e:
-        print(f"estado_clientes cerrar {mid}:", e)
-  return cerradas
 
 
 def sincronizar_cliente(cliente_id: str) -> dict:
@@ -164,7 +117,6 @@ def sincronizar_cliente(cliente_id: str) -> dict:
     if not cli:
       return {}
     membs = supabase.table("membresias").select(SEL_MEMB).eq("cliente_id", cliente_id).execute().data or []
-    cerrar_agotadas(membs)
     cambios = _cambios(cli[0], calcular(cli[0], membs))
     if cambios:
       supabase.table("clientes").update(cambios).eq("id", cliente_id).execute()
@@ -197,7 +149,6 @@ async def sincronizar_todos() -> dict:
   # 2. Recalcular a TODOS los clientes (también a los que nunca han tenido plan)
   por_cliente: dict[str, list] = {}
   todas = _todo("membresias", SEL_MEMB)
-  cerrar_agotadas([m for m in todas if m.get("estatus") == "Activa"])   # paquetes con clases ya consumidas
   for m in todas:
     if m.get("cliente_id"):
       por_cliente.setdefault(m["cliente_id"], []).append(m)
