@@ -48,7 +48,7 @@ BEGIN
   IF e_estatus = 'En fila' OR e_pendiente THEN
     UPDATE membresias SET estatus = 'Activa', activacion_pendiente = false, activada_at = now(),
       fecha_inicio = hoy,
-      fecha_fin = CASE WHEN e_por_clases THEN NULL ELSE hoy + e_vig END,
+      fecha_fin = hoy + e_vig,   -- también los planes por clases tienen vigencia en días (antes quedaba NULL)
       stripe_sincronizada = (stripe_subscription_id IS NULL)
     WHERE id = e_id;
     UPDATE clientes SET fecha_venc_plan = (SELECT max(fecha_fin) FROM membresias WHERE cliente_id = NEW.cliente_id AND estatus = 'Activa')
