@@ -51,22 +51,23 @@ async def editar_fechas(request: Request):
   if b.get("activacion_pendiente") is True:
     nuevo_inicio, nuevo_fin, pendiente = hoy, hoy + timedelta(days=vig + DIAS_MAX_ACTIVACION), True
     # Nunca recortar: si ya vence después de lo que tendría al activarse, ponerla en espera le quitaría tiempo
-    if not m.get("activacion_pendiente") and date.fromisoformat(m["fecha_fin"]) > hoy + timedelta(days=vig + DIAS_MAX_ACTIVACION):
+    if not m.get("activacion_pendiente") and m.get("fecha_fin") and date.fromisoformat(m["fecha_fin"]) > hoy + timedelta(days=vig + DIAS_MAX_ACTIVACION):
       raise HTTPException(status_code=400, detail=(
         f"Esta membresía vence el {date.fromisoformat(m['fecha_fin']):%d/%m/%Y}. Ponerla en espera la recortaría, "
         f"porque al activarse solo tendría {vig} días. Si quieres cambiarla, edita las fechas directamente."))
   else:
     try:
-      nuevo_inicio = date.fromisoformat(b.get("fecha_inicio") or m["fecha_inicio"])
-      nuevo_fin    = date.fromisoformat(b.get("fecha_fin") or m["fecha_fin"])
-    except ValueError:
+      nuevo_inicio = date.fromisoformat(str(b.get("fecha_inicio") or m["fecha_inicio"])[:10])
+      nuevo_fin    = date.fromisoformat(str(b.get("fecha_fin") or m["fecha_fin"])[:10])
+    except (ValueError, TypeError):
       raise HTTPException(status_code=400, detail="Fecha inválida")
     if nuevo_fin <= nuevo_inicio:
       raise HTTPException(status_code=400, detail="La fecha de fin debe ser posterior a la de inicio")
     pendiente = False
 
-  fin_anterior = date.fromisoformat(m["fecha_fin"])
-  delta = (nuevo_fin - fin_anterior).days
+  # Membresías migradas / en espera pueden no tener fecha_fin todavía
+  fin_anterior = date.fromisoformat(str(m["fecha_fin"])[:10]) if m.get("fecha_fin") else None
+  delta = (nuevo_fin - fin_anterior).days if fin_anterior else 0
 
   upd = {"fecha_inicio": nuevo_inicio.isoformat(), "fecha_fin": nuevo_fin.isoformat(), "activacion_pendiente": pendiente}
   if pendiente and not m.get("fecha_compra"):
