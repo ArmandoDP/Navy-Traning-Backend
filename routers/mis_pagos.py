@@ -70,7 +70,7 @@ async def estado_tarjeta(request: Request):
 
   hoy = datetime.now(CDMX).date().isoformat()
   memb = supabase.table("membresias").select("id, fecha_fin, activacion_pendiente, stripe_subscription_id, renovacion_cancelada, origen, paquetes(id, nombre, es_recurrente)")\
-    .eq("cliente_id", cli["id"]).eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,fecha_fin.gte.{hoy}")\
+    .eq("cliente_id", cli["id"]).eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,fecha_fin.is.null,fecha_fin.gte.{hoy}")\
     .order("fecha_fin", desc=True).limit(1).execute().data
   m = memb[0] if memb else None
   dias = (date.fromisoformat(m["fecha_fin"]) - date.fromisoformat(hoy)).days if m and m.get("fecha_fin") and not m.get("activacion_pendiente") else None

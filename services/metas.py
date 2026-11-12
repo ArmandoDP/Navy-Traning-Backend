@@ -86,7 +86,7 @@ def hizo_checkin(cliente_id: str, reserva: dict) -> bool:
 # ── Plan activo ───────────────────────────────────────────────────────────────
 def tiene_plan(cliente_id: str) -> bool:
   r = supabase.table("membresias").select("id").eq("cliente_id", cliente_id).eq("estatus", "Activa")\
-    .or_(f"activacion_pendiente.eq.true,fecha_fin.gte.{hoy().isoformat()}").limit(1).execute().data
+    .or_(f"activacion_pendiente.eq.true,fecha_fin.is.null,fecha_fin.gte.{hoy().isoformat()}").limit(1).execute().data
   return bool(r)
 
 
