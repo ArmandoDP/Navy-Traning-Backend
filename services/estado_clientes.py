@@ -24,6 +24,11 @@ def _es_clase_suelta(m: dict) -> bool:
   return any(x in n for x in ("one class", "clase muestra", "clase suelta", "clase de prueba"))
 
 
+def _es_clase_prueba(m: dict) -> bool:
+  n = ((m.get("paquetes") or {}).get("nombre") or "").lower()
+  return "muestra" in n or "prueba" in n
+
+
 def calcular(cliente: dict, membresias: list[dict], hoy: str | None = None) -> dict:
   """Plan, vencimiento y estado de un cliente, SIEMPRE desde sus membresías.
   Estados que se guardan (el CRM los muestra con nombres claros):
@@ -38,7 +43,10 @@ def calcular(cliente: dict, membresias: list[dict], hoy: str | None = None) -> d
   validas = [m for m in membresias if m.get("estatus") != "Cancelada"]
   planes = [m for m in validas if not _es_clase_suelta(m)]
 
-  vigentes = [m for m in planes
+  # Una clase suelta (One Class) vigente o en espera de su 1ª reserva también deja al cliente Activo,
+  # si no, no podría reservar. La clase muestra/prueba sigue contando como Prospecto.
+  puede_reservar = [m for m in validas if not _es_clase_suelta(m) or not _es_clase_prueba(m)]
+  vigentes = [m for m in puede_reservar
               if m.get("estatus") in ("Activa", "Pausada")
               and (m.get("activacion_pendiente") or not m.get("fecha_fin") or (m.get("fecha_fin") or "") >= hoy)]
   if vigentes:
@@ -140,7 +148,8 @@ async def sincronizar_todos() -> dict:
 
   # 2. Recalcular a TODOS los clientes (también a los que nunca han tenido plan)
   por_cliente: dict[str, list] = {}
-  for m in _todo("membresias", SEL_MEMB):
+  todas = _todo("membresias", SEL_MEMB)
+  for m in todas:
     if m.get("cliente_id"):
       por_cliente.setdefault(m["cliente_id"], []).append(m)
   clientes = _todo("clientes", SEL_CLI)

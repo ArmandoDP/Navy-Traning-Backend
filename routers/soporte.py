@@ -245,8 +245,8 @@ async def push_prueba(cliente_id: str, request: Request):
 
 @router.post("/cliente/{cliente_id}/condonar/{penalizacion_id}")
 async def condonar(cliente_id: str, penalizacion_id: str, request: Request):
-  """Perdona una penalización por No Show (desbloquea la app). Solo dirección."""
-  staff = staff_de_sesion(request, roles=["direccion"])
+  """Perdona una penalización por No Show (desbloquea la app). Dirección y gerentes."""
+  staff = staff_de_sesion(request, roles=["direccion", "gerente"])
   c = _cliente(cliente_id)
   r = supabase.table("penalizaciones_noshow").select("*").eq("id", penalizacion_id)\
     .eq("cliente_id", cliente_id).limit(1).execute()

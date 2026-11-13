@@ -45,7 +45,7 @@ def _validar(cliente_id: str, clase: dict, modo: str):
       raise HTTPException(status_code=400, detail=f"Puedes estar en máximo {MAX_LISTAS} listas de espera a la vez.")
   dia = datetime.fromisoformat(clase["horario"].replace("Z", "+00:00")).astimezone(L.CDMX).date().isoformat()
   memb = supabase.table("membresias").select("id, paquetes(clases_incluidas)").eq("cliente_id", cliente_id)\
-    .eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,and(fecha_inicio.lte.{dia},fecha_fin.gte.{dia})")\
+    .eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,and(fecha_inicio.lte.{dia},or(fecha_fin.is.null,fecha_fin.gte.{dia}))")\
     .limit(1).execute().data
   if not memb:
     raise HTTPException(status_code=403, detail="Necesitas un plan activo para ese día para entrar a la lista de espera.")

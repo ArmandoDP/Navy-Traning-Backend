@@ -145,7 +145,7 @@ async def reservar_semana(request: Request):
 
     # Su plan para ese día (y que le queden clases)
     memb = supabase.table("membresias").select("id, paquetes(clases_incluidas, acceso_total)").eq("cliente_id", cli["id"])\
-      .eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,and(fecha_inicio.lte.{dia},fecha_fin.gte.{dia})")\
+      .eq("estatus", "Activa").or_(f"activacion_pendiente.eq.true,and(fecha_inicio.lte.{dia},or(fecha_fin.is.null,fecha_fin.gte.{dia}))")\
       .limit(1).execute().data
     if not memb:
       resultados.append({"clase_id": clase_id, "ok": False, "clase": nombre, "error": "Tu plan no cubre ese día."}); continue
