@@ -360,9 +360,13 @@ async def publicar_clase_totalpass(req: dict):
     if not plan_id:
       raise HTTPException(status_code=400, detail="No hay planId de TotalPass para esta sucursal")
 
+    dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
+    if dt_utc <= datetime.now(timezone.utc):
+      raise HTTPException(status_code=400,
+        detail="Esta clase ya empezó o ya pasó: TotalPass no permite publicar clases en el pasado.")
+
     token = await get_booking_token(sucursal["totalpass_place_api_key"])
 
-    dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
     dt_cdmx = dt_utc - timedelta(hours=6)
     event_date = dt_cdmx.strftime("%Y-%m-%d")
     start_time = dt_cdmx.strftime("%I:%M %p")
@@ -400,7 +404,16 @@ async def publicar_clase_totalpass(req: dict):
         }
       )
       print("TotalPass publicar clase:", res.status_code, res.text[:300])
-      res.raise_for_status()
+      if res.status_code >= 300:
+        # Mostrar en el CRM el motivo real que da TotalPass (no solo "400 Bad Request")
+        try:
+          cuerpo = res.json()
+          motivo = cuerpo.get("message") or cuerpo.get("error") or cuerpo
+          if isinstance(motivo, list):
+            motivo = "; ".join(str(m) for m in motivo)
+        except Exception:
+          motivo = res.text[:300]
+        raise HTTPException(status_code=400, detail=f"TotalPass rechazó la clase ({res.status_code}): {motivo}")
       data = res.json()
 
     occurrence_uuid = data.get("eventOccurrenceUuid")
