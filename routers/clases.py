@@ -16,8 +16,8 @@ MESES        = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto
 
 
 def fmt_fecha(iso: str) -> str:
-    from datetime import datetime
-    dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+    from datetime import datetime, timedelta
+    dt = datetime.fromisoformat(iso.replace('Z', '+00:00')) - timedelta(hours=6)   # fecha en CDMX, igual que fmt_hora
     return f"{dt.day} de {MESES[dt.month - 1]} de {dt.year}"
 
 

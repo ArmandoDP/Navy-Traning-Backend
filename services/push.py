@@ -5,8 +5,32 @@ from services.supabase import supabase
 
 EXPO_TOKEN = os.getenv("EXPO_ACCESS_TOKEN")
 
+def _revisar_respuesta_expo(res, chunk: list[dict]):
+  """Expo responde 200 aunque rechace tokens: se leen los 'tickets' para que los fallos queden en los logs
+  y se borren los tokens que ya no existen (DeviceNotRegistered). Nunca lanza error."""
+  try:
+    if res.status_code >= 400:
+      print(f"push: Expo respondió {res.status_code}: {res.text[:200]}")
+      return
+    tickets = (res.json() or {}).get("data") or []
+    invalidos = []
+    for msg, t in zip(chunk, tickets):
+      if (t or {}).get("status") != "error":
+        continue
+      err = ((t.get("details") or {}).get("error")) or "desconocido"
+      print(f"push: Expo rechazó el token …{str(msg['to'])[-8:]} ({err}): {t.get('message')}")
+      if err == "DeviceNotRegistered":
+        invalidos.append(msg["to"])
+    if invalidos:
+      supabase.table("push_tokens").delete().in_("token", invalidos).execute()
+      print(f"push: {len(invalidos)} token(s) inválido(s) eliminados")
+  except Exception as e:
+    print(f"push: no se pudo revisar la respuesta de Expo: {e}")
+
+
 async def enviar_push(tokens: list[str], titulo: str, cuerpo: str, data: dict = {}):
   if not tokens:
+    print(f"push: el cliente no tiene tokens, no se envió «{titulo}»")
     return
 
   messages = [
@@ -23,7 +47,7 @@ async def enviar_push(tokens: list[str], titulo: str, cuerpo: str, data: dict = 
   async with httpx.AsyncClient() as client:
     for i in range(0, len(messages), 100):
       chunk = messages[i:i+100]
-      await client.post(
+      res = await client.post(
         "https://exp.host/--/api/v2/push/send",
         json=chunk,
         headers={
@@ -31,6 +55,7 @@ async def enviar_push(tokens: list[str], titulo: str, cuerpo: str, data: dict = 
           "Content-Type":  "application/json",
         }
       )
+      _revisar_respuesta_expo(res, chunk)
 
 async def check_recordatorios_clase():
   """Corre cada hora — manda push 1 día antes y 1 hora antes de cada clase"""
