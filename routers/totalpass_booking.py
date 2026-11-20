@@ -400,7 +400,11 @@ async def publicar_clase_totalpass(req: dict):
           "timezone":    "es-MX",
           "status":      "ACTIVE",
           "description": descripcion or nombre,
-          **({"maxTimeToCancel": max_cancel} if dt_utc - timedelta(minutes=VENTANA_CANCELACION_MIN) > datetime.now(dt_utc.tzinfo) else {}),
+          # maxTimeToCancel va en hora de CDMX, pero TotalPass lo compara como si fuera UTC (6 h antes):
+          # solo se manda si aun así queda en el futuro; si no, TotalPass usa su límite por defecto.
+          **({"maxTimeToCancel": max_cancel}
+             if dt_utc - timedelta(minutes=VENTANA_CANCELACION_MIN) > datetime.now(timezone.utc) + timedelta(hours=6, minutes=5)
+             else {}),
         }
       )
       print("TotalPass publicar clase:", res.status_code, res.text[:300])
