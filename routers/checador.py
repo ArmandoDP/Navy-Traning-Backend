@@ -13,7 +13,7 @@
 #   - Toda entrada queda "pendiente" hasta que Front Desk la confirme. Nadie confirma la suya,
 #     salvo el primero de Front Desk / gerencia que llega cuando no hay nadie más para confirmarlo.
 #   - La salida no necesita confirmación.
-import hashlib, math, secrets
+import hashlib, math, os, secrets, time
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -25,6 +25,9 @@ CDMX               = timezone(timedelta(hours=-6))
 CRM_URL            = "https://crm.navytrainingcenter.com"
 QR_VIDA_SEG        = 15      # cuánto vive un QR sin usarse
 RADIO_M            = 300     # distancia máxima a la sucursal
+# Validación de ubicación: apagada por defecto mientras se prueba.
+# Para prenderla: en Railway, variable CHECADOR_UBICACION=on (no hay que tocar código).
+VALIDAR_UBICACION  = os.getenv("CHECADOR_UBICACION", "off").lower() == "on"
 VENTANA_ANTES_MIN  = 120     # puede checar desde 2 h antes de su primera clase
 TOLERANCIA_MIN     = 15      # una clase cuenta si checó antes de inicio + 15 min
 GRACIA_SALIDA_MIN  = 10      # el staff que olvida su salida se cierra 10 min después de su hora
@@ -76,12 +79,31 @@ def _ip(request: Request) -> str | None:
 # Sesión: quién es el staff que llama
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Caché en memoria: evita validar la sesión y buscar al staff en cada llamada
+# (la pantalla de Front Desk consulta cada 2 s). Dura 2 minutos.
+CACHE_SEG = 120
+_cache_staff: dict[str, tuple[float, dict]] = {}
+_cache_sucursales: dict[str, tuple[float, set]] = {}
+
+
+def _limpiar_cache():
+  if len(_cache_staff) > 500 or len(_cache_sucursales) > 500:
+    ahora = time.time()
+    for c in (_cache_staff, _cache_sucursales):
+      for k in [k for k, (vence, _) in c.items() if vence < ahora]:
+        c.pop(k, None)
+
+
 def _staff(request: Request) -> dict:
   auth = request.headers.get("authorization") or ""
   if not auth.lower().startswith("bearer "):
     raise HTTPException(status_code=401, detail="Inicia sesión para continuar.")
+  token = auth[7:].strip()
+  hit = _cache_staff.get(token)
+  if hit and hit[0] > time.time():
+    return hit[1]
   try:
-    usuario = supabase.auth.get_user(auth[7:].strip()).user
+    usuario = supabase.auth.get_user(token).user
   except Exception:
     usuario = None
   if not usuario:
@@ -98,6 +120,8 @@ def _staff(request: Request) -> dict:
   s = filas[0]
   if (s.get("estatus") or "").lower() in ("inactivo", "baja"):
     raise HTTPException(status_code=403, detail="Tu usuario de staff está inactivo.")
+  _limpiar_cache()
+  _cache_staff[token] = (time.time() + CACHE_SEG, s)
   return s
 
 
@@ -106,11 +130,16 @@ def _es_admin(s: dict) -> bool:
 
 
 def _sucursales_de(s: dict) -> set[str]:
+  hit = _cache_sucursales.get(s["id"])
+  if hit and hit[0] > time.time():
+    return hit[1]
   if _es_admin(s):
-    return {x["id"] for x in supabase.table("sucursales").select("id").execute().data or []}
-  ids = {x["sucursal_id"] for x in supabase.table("staff_sucursales").select("sucursal_id").eq("staff_id", s["id"]).execute().data or []}
-  if s.get("sucursal_asignada_id"):
-    ids.add(s["sucursal_asignada_id"])
+    ids = {x["id"] for x in supabase.table("sucursales").select("id").execute().data or []}
+  else:
+    ids = {x["sucursal_id"] for x in supabase.table("staff_sucursales").select("sucursal_id").eq("staff_id", s["id"]).execute().data or []}
+    if s.get("sucursal_asignada_id"):
+      ids.add(s["sucursal_asignada_id"])
+  _cache_sucursales[s["id"]] = (time.time() + CACHE_SEG, ids)
   return ids
 
 
@@ -378,15 +407,15 @@ async def escanear(body: Escaneo, request: Request):
 
   suc = supabase.table("sucursales").select("id, nombre, latitud, longitud").eq("id", suc_id).single().execute().data
 
-  # 2. Ubicación
-  if body.latitud is None or body.longitud is None:
+  # 2. Ubicación (si la validación está apagada, solo se guarda la distancia para verla en Front Desk)
+  if VALIDAR_UBICACION and (body.latitud is None or body.longitud is None):
     _intento(s, suc_id, "sin_ubicacion", "El celular no mandó ubicación", request, body)
     return _rechazo("sin_ubicacion", "Activa tu ubicación", "Para checar necesitamos saber que estás en la sucursal.")
   distancia = None
-  if suc.get("latitud") is not None and suc.get("longitud") is not None:
+  if body.latitud is not None and body.longitud is not None and suc.get("latitud") is not None and suc.get("longitud") is not None:
     distancia = round(_distancia_m(body.latitud, body.longitud, suc["latitud"], suc["longitud"]))
     margen = min(body.precision_m or 0, 150)                  # el GPS adentro de un edificio falla unos metros
-    if distancia - margen > RADIO_M:
+    if VALIDAR_UBICACION and distancia - margen > RADIO_M:
       _intento(s, suc_id, "lejos", f"A {distancia} m de la sucursal", request, body, distancia)
       return _rechazo("lejos", f"Estás a {distancia / 1000:.1f} km de {suc['nombre']}",
                       "Tienes que checar en Front Desk.", distancia_m=distancia, sucursal=suc["nombre"])
@@ -497,6 +526,7 @@ async def hoy(request: Request):
   out = {
     "nombre": s.get("nombre"), "adentro": adentro,
     "checada_id": u["id"] if u else None,
+    "hora": u["registrado_at"] if u else None,
     "estado": ("confirmada" if u and u["estado"] in ("automatica", "manual") else (u["estado"] if u else None)),
     "sucursal": (u.get("sucursales") or {}).get("nombre") if u else None,
   }
