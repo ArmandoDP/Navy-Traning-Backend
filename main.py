@@ -4,7 +4,9 @@ from dotenv import load_dotenv
 from routers import (
   crons, pagos, totalpass, totalpass_booking, totalpass_checkin, clientes, clases, wellhub,
   confirmar_reserva, sincronizacion, editar_clase, stripe_pagos, membresias, soporte, cobros, estado_clientes, metas, lista_espera, mis_pagos, clientes_admin, promociones,
+  checador,
 )
+from routers.checador import generar_clases_impartidas, cerrar_salidas_olvidadas
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.pausas import reanudar_pausas_vencidas
 from services.planes import avanzar_planes
@@ -77,6 +79,7 @@ app.include_router(mis_pagos.router,         prefix="/mis-pagos")          # his
 app.include_router(clientes_admin.router,    prefix="/clientes-admin")     # eliminar y unir clientes (dirección)
 app.include_router(promociones.router,       prefix="/promociones")        # descuentos y promociones
 app.include_router(plataformas.router,       prefix="/plataformas")        # Wellhub y TotalPass por sucursal
+app.include_router(checador.router,          prefix="/checador")           # checador de staff y clases impartidas
 app.include_router(confirmar_reserva.router)                               # sin prefix
 
 # Scheduler (horas en UTC: CDMX = UTC-6)
@@ -100,6 +103,8 @@ async def startup():
   scheduler.add_job(avisos_lista_espera,           'interval', seconds=30)         # avisos de lista de espera
   scheduler.add_job(cerrar_listas_espera,          'interval', minutes=5)          # cierre de la asignación automática
   scheduler.add_job(recordatorio_tarjeta,          'cron', hour=17, minute=0)     # 11:00 CDMX: tarjeta antes de que venza el plan
+  scheduler.add_job(generar_clases_impartidas,     'cron', minute='*/10')          # checador: lo que se paga por cada clase
+  scheduler.add_job(cerrar_salidas_olvidadas,      'cron', minute='*/10')          # checador: salidas que nadie checó
   scheduler.start()
 
 @app.on_event("shutdown")
