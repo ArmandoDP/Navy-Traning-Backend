@@ -1,6 +1,8 @@
 from fastapi               import APIRouter, Request, HTTPException
 from services.supabase     import supabase
 from routers.sincronizacion import sincronizar_cupos
+from datetime              import datetime, timedelta, timezone
+import asyncio
 import httpx
 import os
 
@@ -17,32 +19,51 @@ def get_place_api_key(sucursal_id: str) -> str:
   return res.data["totalpass_place_api_key"]
 
 
-async def get_booking_token(place_api_key: str) -> str:
-  async with httpx.AsyncClient() as client:
-    res = await client.post(
-      f"{BOOKING_BASE_URL}/partner/auth",
-      json={
-        "partner_api_key": PARTNER_API_KEY,
-        "place_api_key":   place_api_key,
-      }
-    )
-    print("TotalPass auth status:", res.status_code)
-    res.raise_for_status()
-    return res.json()["token"]
-
-
-async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "reason_not_provided"):
-  async with httpx.AsyncClient() as client:
-    res = await client.put(
-      f"{BOOKING_BASE_URL}/partner/slot/confirmSlot/{slot_id}",
-      headers={ "Authorization": f"Bearer {token}" },
-      json={ "state": state, "reason": reason }
-    )
-    print(f"confirmar_slot: {res.status_code} {res.text[:100]}")
+async def get_booking_token(place_api_key: str, intentos: int = 3) -> str:
+  """Token de TotalPass con reintentos: una falla momentánea ya no deja la reserva a medias."""
+  ultimo = None
+  for i in range(intentos):
     try:
-      return res.json()
-    except Exception:
-      return {}
+      async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+          f"{BOOKING_BASE_URL}/partner/auth",
+          json={
+            "partner_api_key": PARTNER_API_KEY,
+            "place_api_key":   place_api_key,
+          }
+        )
+      print("TotalPass auth status:", res.status_code)
+      if res.status_code < 300:
+        return res.json()["token"]
+      ultimo = f"{res.status_code} {res.text[:120]}"
+      if res.status_code in (400, 401, 403):
+        break                                     # credenciales malas: reintentar no sirve
+    except Exception as e:
+      ultimo = str(e)
+    await asyncio.sleep(1.5 * (i + 1))
+  raise RuntimeError(f"Auth TotalPass falló: {ultimo}")
+
+
+async def confirmar_slot(slot_id: str, token: str, state: str, reason: str = "reason_not_provided",
+                         intentos: int = 3) -> bool:
+  """Confirma o rechaza el lugar en TotalPass. Regresa True si TotalPass lo aceptó."""
+  for i in range(intentos):
+    try:
+      async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.put(
+          f"{BOOKING_BASE_URL}/partner/slot/confirmSlot/{slot_id}",
+          headers={ "Authorization": f"Bearer {token}" },
+          json={ "state": state, "reason": reason }
+        )
+      print(f"confirmar_slot ({state}): {res.status_code} {res.text[:100]}")
+      if res.status_code < 300:
+        return True
+      if 400 <= res.status_code < 500 and res.status_code != 429:
+        return False                              # TotalPass lo rechazó (ya confirmado, vencido…): no reintentar
+    except Exception as e:
+      print(f"confirmar_slot error: {e}")
+    await asyncio.sleep(1.5 * (i + 1))
+  return False
 
 
 VENTANA_CANCELACION_MIN = int(os.getenv("CANCELACION_MIN", "720"))   # 12 h: cancelar después = cancelación tardía (alerta)
@@ -160,91 +181,125 @@ async def totalpass_booking_webhook(request: Request):
       print(f"Aviso TotalPass {slot_id} ({estado}) es de una reserva ya registrada — se guarda como alias")
       return { "received": True, "duplicado": True }
 
-    place_api_key = get_place_api_key(clase["sucursal_id"]) if clase.get("sucursal_id") \
-      else os.getenv("TOTALPASS_PLACE_API_KEY")
-
-    # Buscar / crear cliente (sin importar mayúsculas)
-    cliente_id = None
-    if email:
-      cliente_res = supabase.table("clientes").select("id").ilike("email", email).limit(1).execute()
-      cliente_id  = cliente_res.data[0]["id"] if cliente_res.data else None
-
-    if not cliente_id and email:
-      try:
-        nombre_completo = nombre.strip() if nombre.strip() else email.split("@")[0]
-        nuevo = supabase.table("clientes").insert({
-          "nombre_completo": nombre_completo,
-          "email":           email,
-          "estatus":         "Activo",
-          "plan":            "TotalPass",
-          "origen":          "TotalPass",
-          "sucursal_id":     clase.get("sucursal_id"),
-        }).execute()
-        cliente_id = nuevo.data[0]["id"] if nuevo.data else None
-        print(f"Cliente TotalPass creado: {email}")
-      except Exception as e:
-        print(f"Error creando cliente TotalPass: {e}")
-
-    # Si ya tiene una reserva activa en esta clase, se reutiliza y se CONFIRMA la nueva solicitud
-    # (antes se ignoraba y TotalPass la rechazaba aunque hubiera lugar)
-    reserva_existente = None
-    if cliente_id:
-      ex = supabase.table("reservas").select("id")\
-        .eq("cliente_id", cliente_id).eq("clase_id", clase["id"])\
-        .neq("estatus", "Cancelada").limit(1).execute()
-      reserva_existente = ex.data[0]["id"] if ex.data else None
-
-    supabase.table("totalpass_bookings").update({
-      "cliente_id": cliente_id,
-      "estatus":    "Pendiente",
-      "reserva_id": reserva_existente,
-    }).eq("slot_id", slot_id).execute()
-
-    token = await get_booking_token(place_api_key)
-
-    activas_res = supabase.table("reservas").select("id", count="exact")\
-      .eq("clase_id", clase["id"]).neq("estatus", "Cancelada").execute()
-    activas  = activas_res.count or 0
-    hay_cupo = bool(reserva_existente) or activas < (clase.get("capacidad_max") or 999)
-
-    if hay_cupo:
-      reserva_id = reserva_existente
-      if not reserva_id:
-        try:
-          ins = supabase.table("reservas").insert({
-            "clase_id":       clase["id"],
-            "cliente_id":     cliente_id,
-            "estatus":        "Confirmada",
-            "origen":         "TotalPass",
-            "nombre_externo": None if cliente_id else nombre,
-            "email_externo":  None if cliente_id else email,
-          }).execute()
-          reserva_id = ins.data[0]["id"] if ins.data else None
-        except Exception as e:
-          print(f"Error insertando reserva TotalPass: {e}")
-
-      await sincronizar_cupos(clase["id"])
-
-      try:
-        await confirmar_slot(slot_id, token, "confirmed")
-        supabase.table("totalpass_bookings").update({"estatus": "Confirmado", "reserva_id": reserva_id})\
-          .eq("slot_id", slot_id).execute()
-      except Exception as errConfirm:
-        print("Error confirmando booking:", str(errConfirm))
-
-    else:
-      try:
-        await confirmar_slot(slot_id, token, "denied", "class_overbooked")
-        supabase.table("totalpass_bookings").update({ "estatus": "Rechazado" })\
-          .eq("slot_id", slot_id).execute()
-      except Exception as errReject:
-        print("Error rechazando booking:", str(errReject))
-
-    return { "received": True, "confirmado": hay_cupo }
+    return await _procesar_reserva(slot_id, clase, email, nombre)
 
   except Exception as e:
     print("Error TotalPass Booking webhook:", str(e))
     return { "received": True, "error": str(e) }
+
+
+async def _procesar_reserva(slot_id: str, clase: dict, email: str | None, nombre: str) -> dict:
+  """Crea (o reutiliza) la reserva en Navy y confirma el lugar con TotalPass.
+  Es segura de repetir: el proceso de reintentos la vuelve a llamar con los avisos que quedaron a medias.
+  Orden: primero la reserva en el CRM, luego la confirmación con TotalPass. Si TotalPass falla,
+  la reserva ya existe y el aviso queda 'Pendiente' para reintentar la confirmación."""
+  # Buscar / crear cliente (sin importar mayúsculas)
+  cliente_id = None
+  if email:
+    cliente_res = supabase.table("clientes").select("id").ilike("email", email).limit(1).execute()
+    cliente_id  = cliente_res.data[0]["id"] if cliente_res.data else None
+
+  if not cliente_id and email:
+    try:
+      nombre_completo = nombre.strip() if (nombre or "").strip() else email.split("@")[0]
+      nuevo = supabase.table("clientes").insert({
+        "nombre_completo": nombre_completo,
+        "email":           email,
+        "estatus":         "Activo",
+        "plan":            "TotalPass",
+        "origen":          "TotalPass",
+        "sucursal_id":     clase.get("sucursal_id"),
+      }).execute()
+      cliente_id = nuevo.data[0]["id"] if nuevo.data else None
+      print(f"Cliente TotalPass creado: {email}")
+    except Exception as e:
+      print(f"Error creando cliente TotalPass: {e}")
+
+  # Si ya tiene una reserva activa en esta clase, se reutiliza (también al reintentar)
+  reserva_id = None
+  if cliente_id:
+    ex = supabase.table("reservas").select("id")\
+      .eq("cliente_id", cliente_id).eq("clase_id", clase["id"])\
+      .neq("estatus", "Cancelada").limit(1).execute()
+    reserva_id = ex.data[0]["id"] if ex.data else None
+
+  supabase.table("totalpass_bookings").update({
+    "cliente_id": cliente_id,
+    "estatus":    "Pendiente",
+    "reserva_id": reserva_id,
+  }).eq("slot_id", slot_id).execute()
+
+  activas_res = supabase.table("reservas").select("id", count="exact")\
+    .eq("clase_id", clase["id"]).neq("estatus", "Cancelada").execute()
+  activas  = activas_res.count or 0
+  hay_cupo = bool(reserva_id) or activas < (clase.get("capacidad_max") or 999)
+
+  # 1. Primero la reserva en el CRM (aunque TotalPass falle después, ya queda registrada)
+  if hay_cupo and not reserva_id:
+    try:
+      ins = supabase.table("reservas").insert({
+        "clase_id":       clase["id"],
+        "cliente_id":     cliente_id,
+        "estatus":        "Confirmada",
+        "origen":         "TotalPass",
+        "nombre_externo": None if cliente_id else nombre,
+        "email_externo":  None if cliente_id else email,
+      }).execute()
+      reserva_id = ins.data[0]["id"] if ins.data else None
+    except Exception as e:
+      print(f"Error insertando reserva TotalPass: {e}")
+    supabase.table("totalpass_bookings").update({"reserva_id": reserva_id}).eq("slot_id", slot_id).execute()
+
+  if hay_cupo:
+    try:
+      await sincronizar_cupos(clase["id"])
+    except Exception as e:
+      print(f"Sync cupos TotalPass falló (no bloquea la reserva): {e}")
+
+  # 2. Después, confirmar o rechazar con TotalPass (con reintentos)
+  place_api_key = get_place_api_key(clase["sucursal_id"]) if clase.get("sucursal_id") \
+    else os.getenv("TOTALPASS_PLACE_API_KEY")
+  try:
+    token = await get_booking_token(place_api_key)
+  except Exception as e:
+    print(f"⚠️ TotalPass sin token para {slot_id}: {e} — queda Pendiente para reintentar")
+    return {"received": True, "confirmado": hay_cupo, "pendiente_totalpass": True}
+
+  if hay_cupo:
+    if await confirmar_slot(slot_id, token, "confirmed"):
+      supabase.table("totalpass_bookings").update({"estatus": "Confirmado", "reserva_id": reserva_id})\
+        .eq("slot_id", slot_id).execute()
+    else:
+      print(f"⚠️ TotalPass no aceptó la confirmación de {slot_id} — queda Pendiente para reintentar")
+  else:
+    if await confirmar_slot(slot_id, token, "denied", "class_overbooked"):
+      supabase.table("totalpass_bookings").update({"estatus": "Rechazado"}).eq("slot_id", slot_id).execute()
+
+  return {"received": True, "confirmado": hay_cupo}
+
+
+async def reintentar_totalpass_pendientes():
+  """Cada 5 min: retoma los avisos que se quedaron a medias (sin reserva o sin confirmar en TotalPass)
+  y que son de clases que todavía no empiezan."""
+  ahora = datetime.now(timezone.utc)
+  filas = supabase.table("totalpass_bookings")\
+    .select("slot_id, email, nombre, clase_id, estatus")\
+    .eq("principal", True).in_("estatus", ["Procesando", "Pendiente"])\
+    .gte("created_at", (ahora - timedelta(days=3)).isoformat())\
+    .lte("created_at", (ahora - timedelta(minutes=2)).isoformat())\
+    .limit(50).execute().data or []
+  for b in filas:
+    try:
+      cl = supabase.table("clases").select("id, capacidad_max, sucursal_id, horario, estado")\
+        .eq("id", b["clase_id"]).limit(1).execute().data
+      if not cl or cl[0].get("estado") == "Cancelada":
+        continue
+      if datetime.fromisoformat(str(cl[0]["horario"]).replace("Z", "+00:00")) <= ahora:
+        continue                                  # la clase ya empezó: ya no tiene caso
+      print(f"🔁 Reintentando reserva TotalPass {b['slot_id']} ({b.get('email')})")
+      await _procesar_reserva(b["slot_id"], cl[0], b.get("email"), b.get("nombre") or "")
+    except Exception as e:
+      print(f"Reintento TotalPass {b.get('slot_id')} falló: {e}")
 
 
 @router.post("/booking/registrar-webhook")
@@ -307,7 +362,6 @@ async def publicar_clase_totalpass(req: dict):
 
     token = await get_booking_token(sucursal["totalpass_place_api_key"])
 
-    from datetime import datetime, timedelta
     dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
     dt_cdmx = dt_utc - timedelta(hours=6)
     event_date = dt_cdmx.strftime("%Y-%m-%d")
@@ -414,7 +468,6 @@ async def actualizar_clase_totalpass(req: dict):
   if duracion_minutos: payload["duration"]    = duracion_minutos
   if capacidad_max:    payload["slots"]       = capacidad_max
   if horario:
-    from datetime import datetime, timedelta
     dt_utc  = datetime.fromisoformat(horario.replace("Z", "+00:00"))
     dt_cdmx = dt_utc - timedelta(hours=6)
     payload["eventDate"] = dt_cdmx.strftime("%Y-%m-%d")

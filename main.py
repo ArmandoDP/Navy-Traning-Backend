@@ -7,6 +7,7 @@ from routers import (
   checador,
 )
 from routers.checador import generar_clases_impartidas, cerrar_salidas_olvidadas
+from routers.totalpass_booking import reintentar_totalpass_pendientes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.pausas import reanudar_pausas_vencidas
 from services.planes import avanzar_planes
@@ -105,6 +106,7 @@ async def startup():
   scheduler.add_job(recordatorio_tarjeta,          'cron', hour=17, minute=0)     # 11:00 CDMX: tarjeta antes de que venza el plan
   scheduler.add_job(generar_clases_impartidas,     'cron', minute='*/10')          # checador: lo que se paga por cada clase
   scheduler.add_job(cerrar_salidas_olvidadas,      'cron', minute='*/10')          # checador: salidas que nadie checó
+  scheduler.add_job(reintentar_totalpass_pendientes, 'interval', minutes=5)        # TotalPass: reservas que quedaron a medias
   scheduler.start()
 
 @app.on_event("shutdown")
