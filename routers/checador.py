@@ -250,6 +250,94 @@ def _turno_de_hoy(staff_id: str, sucursal_id: str) -> tuple[bool, datetime | Non
   return True, vigente
 
 
+PUESTOS = {"front": "Front Desk", "galley": "The Galley", "manager": "Manager", "submanager": "Submanager",
+           "admin": "Dirección", "staff": "Staff", "staff general": "Staff"}
+
+
+def _puesto(st: dict) -> str:
+  t = (st.get("tipo") or "").strip().lower()
+  if t == "coach":
+    return f"Coach · {st['nivel']}" if st.get("nivel") else "Coach"
+  return PUESTOS.get(t, (st.get("tipo") or "Staff").strip())
+
+
+def _iniciales(st: dict) -> str:
+  partes = [(st.get("nombre") or "").strip(), (st.get("primer_apellido") or "").strip()]
+  palabras = " ".join(x for x in partes if x).split()
+  if not palabras:
+    return "?"
+  return (palabras[0][0] + (palabras[1][0] if len(palabras) > 1 else "")).upper()
+
+
+def _quincena(momento: datetime | None = None) -> tuple[datetime, datetime]:
+  """Inicio y fin (UTC) de la quincena actual en CDMX: del 1 al 15 y del 16 a fin de mes."""
+  local = (momento or _ahora()).astimezone(CDMX).replace(hour=0, minute=0, second=0, microsecond=0)
+  if local.day <= 15:
+    ini, fin = local.replace(day=1), local.replace(day=16)
+  else:
+    ini = local.replace(day=16)
+    fin = (local.replace(day=28) + timedelta(days=4)).replace(day=1)
+  return ini.astimezone(timezone.utc), fin.astimezone(timezone.utc)
+
+
+def _horario_semana(staff_id: str, sucursal_id: str) -> dict:
+  bloques = supabase.table("staff_horarios").select("dia_semana, hora_entrada, hora_salida")\
+    .eq("staff_id", staff_id).eq("sucursal_id", sucursal_id).eq("activo", True)\
+    .order("hora_entrada").execute().data or []
+  hoy = _ahora().astimezone(CDMX).isoweekday() % 7
+  return {
+    "dias": sorted({b["dia_semana"] for b in bloques}),
+    "hoy_idx": hoy,
+    "hoy": [{"entrada": b["hora_entrada"][:5], "salida": b["hora_salida"][:5]} for b in bloques if b["dia_semana"] == hoy],
+  }
+
+
+def _quincena_staff(staff_id: str, sucursal_id: str | None = None) -> dict:
+  """Días trabajados y horas de la quincena (entrada → salida; si sigue adentro, hasta ahora)."""
+  ini, fin = _quincena()
+  q = supabase.table("checadas").select("tipo, estado, registrado_at").eq("staff_id", staff_id)\
+    .gte("registrado_at", ini.isoformat()).lt("registrado_at", fin.isoformat()).neq("estado", "rechazada")
+  if sucursal_id:
+    q = q.eq("sucursal_id", sucursal_id)
+  filas = q.order("registrado_at").execute().data or []
+  dias, minutos, abierta = set(), 0.0, None
+  for f in filas:
+    t = _dt(f["registrado_at"])
+    if f["tipo"] == "entrada" and f["estado"] in ("confirmada", "automatica", "manual"):
+      abierta = t
+      dias.add(t.astimezone(CDMX).date())
+    elif f["tipo"] == "salida" and abierta:
+      minutos += (t - abierta).total_seconds() / 60
+      abierta = None
+  if abierta and abierta.astimezone(CDMX).date() == _ahora().astimezone(CDMX).date():
+    minutos += (_ahora() - abierta).total_seconds() / 60
+  return {"dias": len(dias), "horas": round(minutos / 60, 1)}
+
+
+def _ficha(f: dict, sucursal_id: str) -> dict:
+  """Todo lo que Front Desk necesita ver en el pop-up para confirmar a alguien."""
+  st = f.get("staff") or {}
+  es_coach = (st.get("tipo_pago") or "") == "Por clase"
+  ficha = {
+    "id": f["id"], "staff_id": f["staff_id"], "tipo": f["tipo"], "hora": f["registrado_at"],
+    "nombre": _nombre(st), "iniciales": _iniciales(st), "puesto": _puesto(st),
+    "tipo_staff": st.get("tipo"), "nivel": st.get("nivel"), "tipo_pago": st.get("tipo_pago"),
+    "es_coach": es_coach, "distancia_m": f.get("distancia_m"), "dia_asignado": f.get("dia_asignado"),
+    "quincena": _quincena_staff(f["staff_id"], sucursal_id),
+  }
+  if es_coach:
+    ficha["clases"] = _clases_hoy(f["staff_id"], sucursal_id)
+  else:
+    h = _horario_semana(f["staff_id"], sucursal_id)
+    ficha["horario"] = h
+    if h["hoy"]:
+      llegada = _dt(f["registrado_at"]).astimezone(CDMX)
+      hh, mm = int(h["hoy"][0]["entrada"][:2]), int(h["hoy"][0]["entrada"][3:5])
+      programada = llegada.replace(hour=hh, minute=mm, second=0, microsecond=0)
+      ficha["minutos_antes"] = int((programada - llegada).total_seconds() // 60)
+  return ficha
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Front Desk: sucursales, QR, pendientes y confirmación
 # ══════════════════════════════════════════════════════════════════════════════
@@ -283,42 +371,123 @@ async def qr(body: PedirQR, request: Request):
 
 @router.get("/pendientes")
 async def pendientes(sucursal_id: str, request: Request):
+  """Se consulta cada 2 s: quién espera confirmación (con su ficha) y una marca del último movimiento,
+  para que la pantalla sepa cuándo renovar el QR y el tablero."""
   _operador(request, sucursal_id)
   ini, _ = _dia_cdmx()
 
-  filas = supabase.table("checadas")\
-    .select("id, staff_id, tipo, estado, registrado_at, distancia_m, dia_asignado, confirmado_at, motivo, staff:staff_id(nombre, primer_apellido, nivel, tipo, tipo_pago)")\
+  pend = supabase.table("checadas")\
+    .select("id, staff_id, tipo, estado, registrado_at, distancia_m, dia_asignado, staff:staff_id(nombre, primer_apellido, nivel, tipo, tipo_pago)")\
+    .eq("sucursal_id", sucursal_id).eq("estado", "pendiente").gte("registrado_at", ini.isoformat())\
+    .order("registrado_at").limit(10).execute().data or []
+
+  ult_ch = supabase.table("checadas").select("created_at").eq("sucursal_id", sucursal_id)\
+    .gte("created_at", ini.isoformat()).order("created_at", desc=True).limit(1).execute().data
+  ult_in = supabase.table("checadas_intentos").select("created_at").eq("sucursal_id", sucursal_id)\
+    .gte("created_at", ini.isoformat()).order("created_at", desc=True).limit(1).execute().data
+  marca = max([x[0]["created_at"] for x in (ult_ch, ult_in) if x] or [""])
+
+  return {"por_confirmar": [_ficha(f, sucursal_id) for f in pend], "ultimo_movimiento": marca}
+
+
+@router.get("/tablero")
+async def tablero(sucursal_id: str, request: Request):
+  """El tablero de la sucursal para Front Desk: quién está adentro, clases del día con su coach,
+  alertas, números del día y movimientos."""
+  _operador(request, sucursal_id)
+  ini, fin = _dia_cdmx()
+  ahora = _ahora()
+
+  checadas = supabase.table("checadas")\
+    .select("id, staff_id, tipo, estado, registrado_at, motivo, staff:staff_id(nombre, primer_apellido, nivel, tipo, tipo_pago)")\
     .eq("sucursal_id", sucursal_id).gte("registrado_at", ini.isoformat())\
-    .order("registrado_at", desc=True).limit(40).execute().data or []
-
-  por_confirmar, recientes = [], []
-  for f in filas:
-    st = f.get("staff") or {}
-    item = {
-      "id": f["id"], "nombre": _nombre(st), "nivel": st.get("nivel"), "tipo": f["tipo"],
-      "estado": f["estado"], "hora": f["registrado_at"], "distancia_m": f.get("distancia_m"),
-      "dia_asignado": f.get("dia_asignado"), "motivo": f.get("motivo"),
-      "es_coach": (st.get("tipo_pago") or "") == "Por clase",
-    }
-    if f["estado"] == "pendiente":
-      item["clases"] = _clases_hoy(f["staff_id"], sucursal_id) if item["es_coach"] else []
-      por_confirmar.append(item)
-    else:
-      recientes.append(item)
-
-  hace = (_ahora() - timedelta(minutes=10)).isoformat()
+    .order("registrado_at").execute().data or []
   intentos = supabase.table("checadas_intentos")\
-    .select("id, motivo, detalle, distancia_m, created_at, staff:staff_id(nombre, primer_apellido)")\
-    .eq("sucursal_id", sucursal_id).gte("created_at", hace)\
-    .order("created_at", desc=True).limit(10).execute().data or []
+    .select("id, motivo, detalle, created_at, staff:staff_id(nombre, primer_apellido)")\
+    .eq("sucursal_id", sucursal_id).gte("created_at", ini.isoformat())\
+    .order("created_at", desc=True).limit(30).execute().data or []
 
+  adentro: dict[str, dict] = {}
+  llegaron: set[str] = set()
+  entradas = salidas = 0
+  ultima = None
+  for c in checadas:
+    st = c.get("staff") or {}
+    if c["tipo"] == "entrada" and c["estado"] in ("confirmada", "automatica", "manual"):
+      entradas += 1
+      llegaron.add(c["staff_id"])
+      adentro[c["staff_id"]] = {"iniciales": _iniciales(st), "nombre": _nombre(st), "puesto": _puesto(st),
+                                "desde": c["registrado_at"], "es_coach": (st.get("tipo_pago") or "") == "Por clase"}
+      ultima = {"iniciales": _iniciales(st), "nombre": _nombre(st), "hora": c["registrado_at"], "estado": c["estado"]}
+    elif c["tipo"] == "salida" and c["estado"] != "rechazada":
+      salidas += 1
+      adentro.pop(c["staff_id"], None)
+
+  # Clases de hoy con su coach y en qué va cada una
+  clases = supabase.table("clases")\
+    .select("id, nombre_clase, horario, duracion_minutos, capacidad_max, coach_id, staff:coach_id(nombre, primer_apellido)")\
+    .eq("sucursal_id", sucursal_id).gte("horario", ini.isoformat()).lt("horario", fin.isoformat())\
+    .neq("estado", "Cancelada").order("horario").execute().data or []
+  lista, alertas, terminadas = [], [], 0
+  for c in clases:
+    if "open gym" in (c.get("nombre_clase") or "").lower():
+      continue
+    inicio = _dt(c["horario"])
+    fin_c = inicio + timedelta(minutes=c.get("duracion_minutos") or 60)
+    coach = _nombre(c.get("staff") or {}) or None
+    cid = c.get("coach_id")
+    if fin_c <= ahora:
+      estado_c = "termino"; terminadas += 1
+    elif not cid:
+      estado_c = "sin_coach"
+    elif inicio <= ahora:
+      estado_c = "en_clase" if cid in llegaron else "no_ha_llegado"
+    elif cid in llegaron:
+      estado_c = "llego"
+    elif inicio - ahora <= timedelta(minutes=30):
+      estado_c = "no_ha_llegado"
+    else:
+      estado_c = "mas_tarde"
+    reservas = supabase.table("reservas").select("id", count="exact", head=True)\
+      .eq("clase_id", c["id"]).neq("estatus", "Cancelada").eq("lista_espera", False).execute().count or 0
+    item = {"id": c["id"], "nombre": (c.get("nombre_clase") or "").strip(), "horario": c["horario"],
+            "duracion": c.get("duracion_minutos") or 60, "cupo": c.get("capacidad_max") or 0,
+            "reservas": reservas, "coach": coach, "estado": estado_c}
+    lista.append(item)
+    if estado_c == "no_ha_llegado":
+      alertas.append({"tipo": "coach_no_llega", "coach": coach, "clase": item["nombre"], "horario": c["horario"]})
+    if estado_c == "sin_coach" and inicio - ahora <= timedelta(hours=2):
+      alertas.append({"tipo": "sin_coach", "coach": None, "clase": item["nombre"], "horario": c["horario"]})
+
+  # Movimientos del día (checadas ya revisadas + intentos rechazados), más reciente primero
+  movimientos = []
+  for c in checadas:
+    if c["estado"] == "pendiente":
+      continue
+    movimientos.append({"id": c["id"], "hora": c["registrado_at"], "nombre": _nombre(c.get("staff") or {}),
+                        "tipo": c["tipo"], "estado": c["estado"], "motivo": c.get("motivo")})
+  for i in intentos:
+    movimientos.append({"id": i["id"], "hora": i["created_at"], "nombre": _nombre(i.get("staff") or {}),
+                        "tipo": "intento", "estado": i["motivo"], "motivo": i.get("detalle")})
+  movimientos.sort(key=lambda m: m["hora"], reverse=True)
+
+  lista_adentro = sorted(adentro.values(), key=lambda a: a["desde"])
   return {
-    "por_confirmar": list(reversed(por_confirmar)),          # el más antiguo primero
-    "recientes": recientes[:15],
-    "rechazados_sistema": [{
-      "id": i["id"], "nombre": _nombre(i.get("staff") or {}), "motivo": i["motivo"],
-      "detalle": i.get("detalle"), "distancia_m": i.get("distancia_m"), "hora": i["created_at"],
-    } for i in intentos],
+    "kpis": {
+      "adentro": len(lista_adentro),
+      "adentro_coaches": sum(1 for a in lista_adentro if a["es_coach"]),
+      "adentro_staff": sum(1 for a in lista_adentro if not a["es_coach"]),
+      "entradas": entradas, "salidas": salidas,
+      "clases": len(lista), "clases_terminadas": terminadas,
+      "rechazos": len(intentos),
+      "rechazo_ejemplo": ({"nombre": _nombre(intentos[0].get("staff") or {}), "motivo": intentos[0]["motivo"]}
+                          if intentos else None),
+    },
+    "alertas": alertas,
+    "clases": lista,
+    "adentro": lista_adentro,
+    "movimientos": movimientos[:25],
+    "ultima_entrada": ultima,
   }
 
 
@@ -485,7 +654,7 @@ async def escanear(body: Escaneo, request: Request):
 @router.get("/estado/{checada_id}")
 async def estado(checada_id: str, request: Request):
   s = _staff(request)
-  fila = supabase.table("checadas").select("id, staff_id, sucursal_id, tipo, estado, registrado_at, motivo, sucursales(nombre)")\
+  fila = supabase.table("checadas").select("id, staff_id, sucursal_id, tipo, estado, registrado_at, motivo, confirmado_por, sucursales(nombre)")\
     .eq("id", checada_id).limit(1).execute().data
   if not fila or fila[0]["staff_id"] != s["id"]:
     raise HTTPException(status_code=404, detail="No encontramos tu checada.")
@@ -494,6 +663,9 @@ async def estado(checada_id: str, request: Request):
          "nombre": s.get("nombre"), "sucursal": (ch.get("sucursales") or {}).get("nombre")}
   if ch["estado"] == "rechazada":
     out["motivo"] = ch.get("motivo")
+  if ch.get("confirmado_por"):
+    quien = supabase.table("staff").select("nombre").eq("id", ch["confirmado_por"]).limit(1).execute().data
+    out["confirmado_por"] = (quien[0].get("nombre") or "").strip().split(" ")[0] if quien else None
   if ch["estado"] == "automatica" and ch["tipo"] == "entrada":
     out["estado"] = "confirmada"
   if out["estado"] == "confirmada" and ch["tipo"] == "entrada":
@@ -504,12 +676,18 @@ async def estado(checada_id: str, request: Request):
 def _vista_del_dia(s: dict, sucursal_id: str, checada_id: str) -> dict:
   """Coach: sus clases con alumnos. Staff: su turno y lo que pasa hoy en la sucursal."""
   if _es_coach(s):
-    return {"vista": "coach", "clases": _clases_hoy(s["id"], sucursal_id, con_alumnos=True)}
+    ini_q, fin_q = _quincena()
+    dadas = supabase.table("clases_impartidas").select("id", count="exact", head=True)\
+      .eq("coach_id", s["id"]).eq("estado", "impartida")\
+      .gte("horario", ini_q.isoformat()).lt("horario", fin_q.isoformat()).execute().count or 0
+    return {"vista": "coach", "clases": _clases_hoy(s["id"], sucursal_id, con_alumnos=True),
+            "quincena": {"clases": dadas}}
   ch = supabase.table("checadas").select("registrado_at, salida_programada").eq("id", checada_id).single().execute().data
   return {
     "vista": "staff",
     "turno": {"entrada": ch["registrado_at"], "salida_programada": ch.get("salida_programada")},
     "sucursal_hoy": _sucursal_hoy(sucursal_id),
+    "quincena": _quincena_staff(s["id"]),
   }
 
 
