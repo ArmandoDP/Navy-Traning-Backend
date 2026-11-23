@@ -246,3 +246,393 @@ async def guardar_banco(staff_id: str, body: BancoIn, request: Request):
     "updated_by": s["id"],
   }).execute()
   return {"ok": True, "banco": _banco(staff_id, True)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parte 2: horarios, festivos, checadas (manual / anular) y faltas y retardos
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import date
+
+
+def _config(clave: str, defecto):
+  fila = supabase.table("staff_config").select("valor").eq("clave", clave).limit(1).execute().data
+  return fila[0]["valor"] if fila else defecto
+
+
+def _dia_semana(d: date) -> int:
+  return d.isoweekday() % 7          # 0 = domingo … 6 = sábado
+
+
+def _nombres(ids: set) -> dict:
+  ids = {i for i in ids if i}
+  if not ids:
+    return {}
+  filas = supabase.table("staff").select("id, nombre, primer_apellido").in_("id", list(ids)).execute().data or []
+  return {f["id"]: f"{f.get('nombre') or ''} {f.get('primer_apellido') or ''}".strip() for f in filas}
+
+
+def _sucursal_requerida(s: dict, sucursal_id: str | None) -> str:
+  if not sucursal_id:
+    raise HTTPException(status_code=400, detail="Elige una sucursal en el selector de arriba.")
+  _alcance(s, sucursal_id)
+  return sucursal_id
+
+
+# ── Configuración ────────────────────────────────────────────────────────────
+class ConfigIn(BaseModel):
+  tolerancia_retardo_min: int
+
+
+@router.get("/config")
+async def ver_config(request: Request):
+  _admin(request)
+  return {"tolerancia_retardo_min": int(_config("tolerancia_retardo_min", 10))}
+
+
+@router.put("/config")
+async def guardar_config(body: ConfigIn, request: Request):
+  s = _admin(request)
+  if not _es_direccion(s):
+    raise HTTPException(status_code=403, detail="Solo Dirección cambia la configuración.")
+  if not 0 <= body.tolerancia_retardo_min <= 120:
+    raise HTTPException(status_code=400, detail="La tolerancia debe estar entre 0 y 120 minutos.")
+  supabase.table("staff_config").upsert({
+    "clave": "tolerancia_retardo_min", "valor": body.tolerancia_retardo_min,
+    "updated_at": _ahora().isoformat(), "updated_by": s["id"],
+  }).execute()
+  return {"ok": True}
+
+
+# ── Horarios ─────────────────────────────────────────────────────────────────
+@router.get("/horarios")
+async def horarios(request: Request, sucursal_id: str | None = None):
+  s = _admin(request)
+  suc = _sucursal_requerida(s, sucursal_id)
+  bloques = supabase.table("staff_horarios").select("staff_id, dia_semana, hora_entrada, hora_salida")\
+    .eq("sucursal_id", suc).eq("activo", True).order("hora_entrada").execute().data or []
+  por_staff: dict[str, list] = {}
+  for b in bloques:
+    por_staff.setdefault(b["staff_id"], []).append({
+      "dia": b["dia_semana"], "entrada": b["hora_entrada"][:5], "salida": b["hora_salida"][:5]})
+  return {"horarios": por_staff}
+
+
+class Bloque(BaseModel):
+  dia: int
+  entrada: str
+  salida: str
+
+
+class HorarioIn(BaseModel):
+  sucursal_id: str
+  bloques: list[Bloque]
+
+
+@router.put("/horarios/{staff_id}")
+async def guardar_horario(staff_id: str, body: HorarioIn, request: Request):
+  s = _admin(request)
+  _alcance(s, body.sucursal_id)
+  _puede_ver(s, staff_id)
+  limpios = []
+  for b in body.bloques:
+    if not 0 <= b.dia <= 6:
+      raise HTTPException(status_code=400, detail="Día inválido.")
+    if b.salida <= b.entrada:
+      raise HTTPException(status_code=400, detail=f"La salida debe ser después de la entrada ({b.entrada}–{b.salida}).")
+    limpios.append(b)
+  # Bloques del mismo día no se pueden encimar
+  for d in range(7):
+    del_dia = sorted([b for b in limpios if b.dia == d], key=lambda b: b.entrada)
+    for a, c in zip(del_dia, del_dia[1:]):
+      if c.entrada < a.salida:
+        raise HTTPException(status_code=400, detail="Hay dos turnos encimados en el mismo día.")
+  supabase.table("staff_horarios").delete().eq("staff_id", staff_id).eq("sucursal_id", body.sucursal_id).execute()
+  if limpios:
+    supabase.table("staff_horarios").insert([{
+      "staff_id": staff_id, "sucursal_id": body.sucursal_id, "dia_semana": b.dia,
+      "hora_entrada": b.entrada, "hora_salida": b.salida, "activo": True, "creado_por": s["id"],
+    } for b in limpios]).execute()
+  # Días laborales en la ficha (para el checador)
+  dias = sorted({b.dia for b in limpios})
+  supabase.table("staff").update({"dias_laborales": dias or None}).eq("id", staff_id).execute()
+  return {"ok": True, "bloques": len(limpios)}
+
+
+# ── Festivos ─────────────────────────────────────────────────────────────────
+def _lunes(anio: int, mes: int, n: int) -> date:
+  d = date(anio, mes, 1)
+  while d.weekday() != 0:
+    d += timedelta(days=1)
+  return d + timedelta(weeks=n - 1)
+
+
+def festivos_oficiales(anio: int) -> list[dict]:
+  """Descansos obligatorios de la Ley Federal del Trabajo (art. 74)."""
+  lista = [
+    (date(anio, 1, 1), "Año Nuevo"),
+    (_lunes(anio, 2, 1), "Día de la Constitución"),
+    (_lunes(anio, 3, 3), "Natalicio de Benito Juárez"),
+    (date(anio, 5, 1), "Día del Trabajo"),
+    (date(anio, 9, 16), "Día de la Independencia"),
+    (_lunes(anio, 11, 3), "Día de la Revolución"),
+    (date(anio, 12, 25), "Navidad"),
+  ]
+  if (anio - 2024) % 6 == 0:
+    lista.append((date(anio, 10, 1), "Transmisión del Poder Ejecutivo"))
+  return [{"fecha": d.isoformat(), "nombre": n} for d, n in sorted(lista)]
+
+
+@router.get("/festivos")
+async def festivos(request: Request, anio: int | None = None):
+  _admin(request)
+  anio = anio or _ahora().astimezone(CDMX).year
+  filas = supabase.table("dias_festivos").select("id, fecha, nombre, multiplicador, sucursal_id, sucursales(nombre)")\
+    .eq("activo", True).gte("fecha", f"{anio}-01-01").lte("fecha", f"{anio}-12-31").order("fecha").execute().data or []
+  return {"anio": anio, "festivos": [{
+    "id": f["id"], "fecha": f["fecha"], "nombre": f["nombre"], "multiplicador": float(f["multiplicador"]),
+    "sucursal_id": f.get("sucursal_id"), "sucursal": (f.get("sucursales") or {}).get("nombre"),
+  } for f in filas], "oficiales": festivos_oficiales(anio)}
+
+
+class FestivoIn(BaseModel):
+  fecha: str
+  nombre: str
+  multiplicador: float = 3
+  sucursal_id: str | None = None
+
+
+def _solo_direccion(s: dict):
+  if not _es_direccion(s):
+    raise HTTPException(status_code=403, detail="Solo Dirección puede hacer este cambio.")
+
+
+@router.post("/festivos")
+async def crear_festivo(body: FestivoIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  if not body.nombre.strip():
+    raise HTTPException(status_code=400, detail="Ponle nombre al festivo.")
+  if body.multiplicador < 1:
+    raise HTTPException(status_code=400, detail="El multiplicador no puede ser menor a 1.")
+  existe = supabase.table("dias_festivos").select("id").eq("fecha", body.fecha).eq("activo", True)
+  existe = (existe.eq("sucursal_id", body.sucursal_id) if body.sucursal_id else existe.is_("sucursal_id", "null")).execute().data
+  if existe:
+    raise HTTPException(status_code=400, detail="Ese día ya está registrado como festivo.")
+  supabase.table("dias_festivos").insert({
+    "fecha": body.fecha, "nombre": body.nombre.strip(), "multiplicador": body.multiplicador,
+    "sucursal_id": body.sucursal_id, "activo": True, "creado_por": s["id"],
+  }).execute()
+  return {"ok": True}
+
+
+@router.post("/festivos/oficiales/{anio}")
+async def cargar_oficiales(anio: int, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  ya = {f["fecha"] for f in supabase.table("dias_festivos").select("fecha").is_("sucursal_id", "null")
+        .gte("fecha", f"{anio}-01-01").lte("fecha", f"{anio}-12-31").execute().data or []}
+  nuevos = [{"fecha": f["fecha"], "nombre": f["nombre"], "multiplicador": 3, "sucursal_id": None,
+             "activo": True, "creado_por": s["id"]} for f in festivos_oficiales(anio) if f["fecha"] not in ya]
+  if nuevos:
+    supabase.table("dias_festivos").insert(nuevos).execute()
+  return {"ok": True, "agregados": len(nuevos)}
+
+
+@router.delete("/festivos/{festivo_id}")
+async def borrar_festivo(festivo_id: str, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  supabase.table("dias_festivos").update({"activo": False}).eq("id", festivo_id).execute()
+  return {"ok": True}
+
+
+# ── Checadas ─────────────────────────────────────────────────────────────────
+def _rango(desde: str | None, hasta: str | None) -> tuple[datetime, datetime, date, date]:
+  """Fechas (CDMX) → rango UTC. Por defecto, la quincena actual."""
+  if desde and hasta:
+    d1, d2 = date.fromisoformat(desde), date.fromisoformat(hasta)
+  else:
+    ini_q, fin_q = _quincena()
+    d1, d2 = ini_q.astimezone(CDMX).date(), (fin_q - timedelta(days=1)).astimezone(CDMX).date()
+  if d2 < d1 or (d2 - d1).days > 62:
+    raise HTTPException(status_code=400, detail="El rango debe ser de máximo 2 meses.")
+  ini = datetime(d1.year, d1.month, d1.day, tzinfo=CDMX).astimezone(timezone.utc)
+  fin = datetime(d2.year, d2.month, d2.day, tzinfo=CDMX).astimezone(timezone.utc) + timedelta(days=1)
+  return ini, fin, d1, d2
+
+
+@router.get("/checadas")
+async def checadas(request: Request, sucursal_id: str | None = None, desde: str | None = None,
+                   hasta: str | None = None, staff_id: str | None = None):
+  s = _admin(request)
+  alcance = _alcance(s, sucursal_id)
+  ini, fin, d1, d2 = _rango(desde, hasta)
+  q = supabase.table("checadas")\
+    .select("id, staff_id, sucursal_id, tipo, estado, registrado_at, motivo, distancia_m, confirmado_por, creado_por, staff:staff_id(nombre, primer_apellido), sucursales(nombre)")\
+    .gte("registrado_at", ini.isoformat()).lt("registrado_at", fin.isoformat())\
+    .order("registrado_at", desc=True).limit(3000)
+  if alcance is not None:
+    q = q.in_("sucursal_id", list(alcance))
+  if staff_id:
+    q = q.eq("staff_id", staff_id)
+  filas = q.execute().data or []
+  quien = _nombres({f.get("confirmado_por") for f in filas} | {f.get("creado_por") for f in filas})
+  return {"desde": d1.isoformat(), "hasta": d2.isoformat(), "checadas": [{
+    "id": f["id"], "staff_id": f["staff_id"],
+    "nombre": f"{(f.get('staff') or {}).get('nombre') or ''} {(f.get('staff') or {}).get('primer_apellido') or ''}".strip(),
+    "sucursal": (f.get("sucursales") or {}).get("nombre"), "tipo": f["tipo"], "estado": f["estado"],
+    "hora": f["registrado_at"], "motivo": f.get("motivo"), "distancia_m": f.get("distancia_m"),
+    "confirmo": quien.get(f.get("confirmado_por")), "capturo": quien.get(f.get("creado_por")),
+  } for f in filas]}
+
+
+class ManualIn(BaseModel):
+  staff_id: str
+  sucursal_id: str
+  tipo: str            # entrada | salida
+  hora: str            # ISO con zona
+  motivo: str
+
+
+@router.post("/checada-manual")
+async def checada_manual(body: ManualIn, request: Request):
+  """Para cuando alguien no trae celular. Queda marcada como manual, con quién la capturó y por qué."""
+  s = _admin(request)
+  _alcance(s, body.sucursal_id)
+  _puede_ver(s, body.staff_id)
+  if body.tipo not in ("entrada", "salida"):
+    raise HTTPException(status_code=400, detail="Tipo inválido.")
+  if len(body.motivo.strip()) < 5:
+    raise HTTPException(status_code=400, detail="Escribe el motivo (por ejemplo: \"No trajo celular\").")
+  if body.staff_id == s["id"]:
+    raise HTTPException(status_code=400, detail="No puedes registrar tu propia checada manual.")
+  hora = _dt(body.hora)
+  ahora = _ahora()
+  if hora > ahora + timedelta(minutes=5):
+    raise HTTPException(status_code=400, detail="La hora no puede ser en el futuro.")
+  limite = timedelta(days=31) if _es_direccion(s) else timedelta(hours=48)
+  if ahora - hora > limite:
+    raise HTTPException(status_code=400, detail="Un Manager solo puede capturar checadas de las últimas 48 horas. Para fechas anteriores, Dirección.")
+  fila = supabase.table("checadas").insert({
+    "staff_id": body.staff_id, "sucursal_id": body.sucursal_id, "tipo": body.tipo,
+    "registrado_at": hora.isoformat(), "estado": "manual", "motivo": body.motivo.strip(),
+    "creado_por": s["id"], "confirmado_por": s["id"], "confirmado_at": ahora.isoformat(),
+  }).execute().data
+  supabase.table("correcciones").insert({
+    "tabla": "checadas", "registro_id": fila[0]["id"], "campo": "alta_manual",
+    "valor_antes": None, "valor_despues": {"tipo": body.tipo, "hora": hora.isoformat()},
+    "motivo": body.motivo.strip(), "hecho_por": s["id"],
+  }).execute()
+  return {"ok": True, "id": fila[0]["id"]}
+
+
+class AnularIn(BaseModel):
+  motivo: str
+
+
+@router.post("/checadas/{checada_id}/anular")
+async def anular_checada(checada_id: str, body: AnularIn, request: Request):
+  """Solo Dirección. La checada no se borra: queda rechazada y el motivo en la bitácora."""
+  s = _admin(request)
+  _solo_direccion(s)
+  if len(body.motivo.strip()) < 5:
+    raise HTTPException(status_code=400, detail="Escribe el motivo de la corrección.")
+  ch = supabase.table("checadas").select("id, estado, tipo, registrado_at").eq("id", checada_id).limit(1).execute().data
+  if not ch:
+    raise HTTPException(status_code=404, detail="No existe esa checada.")
+  if ch[0]["estado"] == "rechazada":
+    raise HTTPException(status_code=400, detail="Esa checada ya está anulada.")
+  supabase.table("checadas").update({"estado": "rechazada", "motivo": f"Anulada por Dirección: {body.motivo.strip()}"})\
+    .eq("id", checada_id).execute()
+  supabase.table("correcciones").insert({
+    "tabla": "checadas", "registro_id": checada_id, "campo": "estado",
+    "valor_antes": {"estado": ch[0]["estado"]}, "valor_despues": {"estado": "rechazada"},
+    "motivo": body.motivo.strip(), "hecho_por": s["id"],
+  }).execute()
+  return {"ok": True}
+
+
+# ── Faltas y retardos ────────────────────────────────────────────────────────
+@router.get("/bitacora")
+async def bitacora(request: Request, sucursal_id: str | None = None, desde: str | None = None, hasta: str | None = None):
+  """Compara el horario de cada persona con sus checadas. No descuenta nada: es para que Dirección decida."""
+  s = _admin(request)
+  alcance = _alcance(s, sucursal_id)
+  ini, fin, d1, d2 = _rango(desde, hasta)
+  tolerancia = int(_config("tolerancia_retardo_min", 10))
+  ahora = _ahora()
+  hoy = ahora.astimezone(CDMX).date()
+
+  qh = supabase.table("staff_horarios").select("staff_id, sucursal_id, dia_semana, hora_entrada, hora_salida")\
+    .eq("activo", True).order("hora_entrada")
+  if alcance is not None:
+    qh = qh.in_("sucursal_id", list(alcance))
+  horarios = qh.execute().data or []
+  if not horarios:
+    return {"tolerancia": tolerancia, "desde": d1.isoformat(), "hasta": d2.isoformat(), "incidencias": [], "personas": []}
+
+  ids = {h["staff_id"] for h in horarios}
+  staff = {f["id"]: f for f in supabase.table("staff").select("id, nombre, primer_apellido, estatus")
+           .in_("id", list(ids)).execute().data or []}
+  sucs = {f["id"]: f["nombre"] for f in supabase.table("sucursales").select("id, nombre").execute().data or []}
+  fest = supabase.table("dias_festivos").select("fecha, nombre, sucursal_id").eq("activo", True)\
+    .gte("fecha", d1.isoformat()).lte("fecha", d2.isoformat()).execute().data or []
+  festivos = {(f["fecha"], f.get("sucursal_id")): f["nombre"] for f in fest}
+
+  entradas: dict[tuple, datetime] = {}
+  for c in supabase.table("checadas").select("staff_id, sucursal_id, registrado_at")\
+      .eq("tipo", "entrada").in_("estado", ["confirmada", "automatica", "manual"])\
+      .in_("staff_id", list(ids)).gte("registrado_at", ini.isoformat()).lt("registrado_at", fin.isoformat())\
+      .order("registrado_at").limit(10000).execute().data or []:
+    t = _dt(c["registrado_at"])
+    clave = (c["staff_id"], c["sucursal_id"], t.astimezone(CDMX).date())
+    entradas.setdefault(clave, t)                     # la primera del día
+
+  primer_bloque: dict[tuple, dict] = {}
+  for h in horarios:
+    primer_bloque.setdefault((h["staff_id"], h["sucursal_id"], h["dia_semana"]), h)
+
+  incidencias = []
+  d = d1
+  while d <= min(d2, hoy):
+    dia = _dia_semana(d)
+    for (sid, suc, ds), h in primer_bloque.items():
+      if ds != dia or (staff.get(sid) or {}).get("estatus", "Activo") not in ("Activo", None):
+        continue
+      hh, mm = int(h["hora_entrada"][:2]), int(h["hora_entrada"][3:5])
+      programada = datetime(d.year, d.month, d.day, hh, mm, tzinfo=CDMX)
+      llegada = entradas.get((sid, suc, d))
+      festivo = festivos.get((d.isoformat(), suc)) or festivos.get((d.isoformat(), None))
+      base = {"fecha": d.isoformat(), "staff_id": sid,
+              "nombre": f"{staff.get(sid, {}).get('nombre') or ''} {staff.get(sid, {}).get('primer_apellido') or ''}".strip(),
+              "sucursal": sucs.get(suc), "programada": h["hora_entrada"][:5],
+              "llegada": llegada.isoformat() if llegada else None}
+      if festivo:
+        if llegada:
+          incidencias.append({**base, "tipo": "festivo_trabajado", "detalle": festivo, "minutos": 0})
+        continue
+      if not llegada:
+        if d == hoy and ahora < programada + timedelta(minutes=tolerancia):
+          continue                                     # todavía no es hora
+        incidencias.append({**base, "tipo": "falta", "detalle": None, "minutos": 0})
+      else:
+        tarde = int((llegada - programada).total_seconds() // 60)
+        if tarde > tolerancia:
+          incidencias.append({**base, "tipo": "retardo", "detalle": None, "minutos": tarde})
+    d += timedelta(days=1)
+
+  resumen: dict[str, dict] = {}
+  for i in incidencias:
+    r = resumen.setdefault(i["staff_id"], {"staff_id": i["staff_id"], "nombre": i["nombre"],
+                                            "faltas": 0, "retardos": 0, "minutos_tarde": 0, "festivos_trabajados": 0})
+    if i["tipo"] == "falta":
+      r["faltas"] += 1
+    elif i["tipo"] == "retardo":
+      r["retardos"] += 1
+      r["minutos_tarde"] += i["minutos"]
+    else:
+      r["festivos_trabajados"] += 1
+  incidencias.sort(key=lambda i: (i["fecha"], i["nombre"]), reverse=True)
+  return {"tolerancia": tolerancia, "desde": d1.isoformat(), "hasta": d2.isoformat(),
+          "incidencias": incidencias,
+          "personas": sorted(resumen.values(), key=lambda r: (-r["faltas"], -r["retardos"], r["nombre"]))}
