@@ -739,15 +739,35 @@ def _tarifa(sucursal_id: str, nivel: str | None, duracion: int, tipo_clase: str 
   return t, round(monto, 2)
 
 
-def _bono(sucursal_id: str, asistentes: int, duracion: int, fecha: str):
-  filas = supabase.table("bonos_asistencia").select("id, min_asistentes, max_asistentes, duracion_minutos, monto, vigente_desde")\
-    .eq("sucursal_id", sucursal_id).eq("activo", True).lte("vigente_desde", fecha)\
-    .lte("min_asistentes", asistentes).execute().data or []
-  validos = [b for b in filas
-             if (b.get("max_asistentes") is None or asistentes <= b["max_asistentes"])
-             and (b.get("duracion_minutos") is None or b["duracion_minutos"] == duracion)]
-  validos.sort(key=lambda b: (b["vigente_desde"], b["duracion_minutos"] is not None, b["min_asistentes"]), reverse=True)
-  return validos[0] if validos else None
+def _bonos(c: dict, nivel: str | None, asistentes: int, duracion: int, inicio: datetime) -> tuple[float, list]:
+  """Aplica las reglas de bono que cumpla la clase. Las acumulables se suman; de las demás, solo la más alta.
+  Regresa (monto total, detalle)."""
+  local = inicio.astimezone(CDMX)
+  fecha = local.date().isoformat()
+  reglas = supabase.table("reglas_bono").select("*").eq("activo", True).lte("vigente_desde", fecha).execute().data or []
+  cupo = c.get("capacidad_max") or 0
+  ocupacion = (asistentes / cupo * 100) if cupo else 0
+  tipo = (c.get("tipo_clase") or "").strip().lower()
+  hora = local.strftime("%H:%M")
+  dia = local.isoweekday() % 7
+  cumplen = []
+  for r in reglas:
+    if r.get("vigente_hasta") and r["vigente_hasta"] < fecha: continue
+    if r.get("niveles") and (nivel or "") not in r["niveles"]: continue
+    if r.get("sucursal_ids") and c["sucursal_id"] not in r["sucursal_ids"]: continue
+    if r.get("tipos_clase") and tipo not in [t.strip().lower() for t in r["tipos_clase"]]: continue
+    if r.get("duraciones") and duracion not in r["duraciones"]: continue
+    if r.get("dias_semana") and dia not in r["dias_semana"]: continue
+    if r.get("hora_desde") and hora < r["hora_desde"][:5]: continue
+    if r.get("hora_hasta") and hora >= r["hora_hasta"][:5]: continue
+    if r.get("min_asistentes") is not None and asistentes < r["min_asistentes"]: continue
+    if r.get("min_ocupacion_pct") is not None and ocupacion < r["min_ocupacion_pct"]: continue
+    cumplen.append(r)
+  acumulables = [r for r in cumplen if r.get("acumulable")]
+  otras = sorted([r for r in cumplen if not r.get("acumulable")], key=lambda r: float(r["monto"]), reverse=True)
+  aplicadas = acumulables + otras[:1]
+  detalle = [{"regla_id": r["id"], "nombre": r["nombre"], "monto": float(r["monto"])} for r in aplicadas]
+  return round(sum(d["monto"] for d in detalle), 2), detalle
 
 
 def _evaluar_clase(c: dict) -> dict:
@@ -762,6 +782,7 @@ def _evaluar_clase(c: dict) -> dict:
     "nivel_coach": None, "tipo_pago_coach": None, "tarifa_id": None, "tarifa_hora": None, "tarifa_modo": None,
     "monto_clase": 0, "asistentes": 0, "bono_id": None, "bono": 0, "total": 0,
     "estado": "revisar", "checada_id": None, "motivo_estado": None,
+    "bonos_detalle": [], "porcentaje_pago": 100, "es_suplencia": False,
   }
 
   nombre = fila["nombre_clase"].lower()
@@ -798,18 +819,34 @@ def _evaluar_clase(c: dict) -> dict:
               for ch in checadas)
 
   tarifa, monto = _tarifa(c["sucursal_id"], coach.get("nivel"), dur, c.get("tipo_clase"), fecha)
-  bono = _bono(c["sucursal_id"], fila["asistentes"], dur, fecha)
-  fila.update({"bono_id": bono["id"] if bono else None, "bono": float(bono["monto"]) if bono else 0})
+
+  # Suplencia: el que cubre cobra la tarifa normal, sin bono
+  cambio = supabase.table("cambios_coach").select("coach_antes, coach_despues").eq("clase_id", c["id"])\
+    .order("created_at", desc=True).limit(1).execute().data
+  fila["es_suplencia"] = bool(cambio and cambio[0].get("coach_despues") == c["coach_id"] and cambio[0].get("coach_antes"))
+
+  if fila["es_suplencia"]:
+    total_bono, detalle = 0.0, []
+  else:
+    total_bono, detalle = _bonos(c, coach.get("nivel"), fila["asistentes"], dur, inicio)
+  fila.update({"bono": total_bono, "bonos_detalle": detalle})
+
+  # Clase sin alumnos (nadie hizo check-in): se paga el 50% y sin bono
+  if fila["asistentes"] == 0:
+    fila.update({"porcentaje_pago": 50, "bono": 0, "bonos_detalle": []})
   if tarifa:
     fila.update({"tarifa_id": tarifa["id"], "tarifa_hora": tarifa["monto"], "tarifa_modo": tarifa["modo"],
-                 "monto_clase": monto})
+                 "monto_clase": round(monto * fila["porcentaje_pago"] / 100, 2)})
   fila["total"] = round(fila["monto_clase"] + fila["bono"], 2)
 
   if entrada:
     fila["checada_id"] = entrada["id"]
     if not tarifa:
-      return {**fila, "motivo_estado": f"Sin tarifa para nivel {coach.get('nivel') or '(vacío)'} en esta sucursal"}
-    return {**fila, "estado": "impartida"}
+      return {**fila, "motivo_estado": f"Sin tarifa para nivel {coach.get('nivel') or '(vacío)'} y {dur} min en esta sucursal"}
+    motivo = []
+    if fila["porcentaje_pago"] < 100: motivo.append("Sin alumnos: se paga el 50%")
+    if fila["es_suplencia"]: motivo.append("Suplencia: tarifa normal sin bono")
+    return {**fila, "estado": "impartida", "motivo_estado": " · ".join(motivo) or None}
   if pendiente:
     return {**fila, "motivo_estado": "Su entrada sigue pendiente de confirmar en Front Desk"}
   if tarde:
@@ -825,7 +862,7 @@ async def generar_clases_impartidas():
   ahora = _ahora()
   desde = (ahora - timedelta(days=3)).isoformat()
   clases = supabase.table("clases")\
-    .select("id, coach_id, sucursal_id, horario, duracion_minutos, nombre_clase, tipo_clase, estado")\
+    .select("id, coach_id, sucursal_id, horario, duracion_minutos, nombre_clase, tipo_clase, estado, capacidad_max")\
     .gte("horario", desde).lte("horario", ahora.isoformat()).neq("estado", "Cancelada")\
     .execute().data or []
   listas = [c for c in clases
