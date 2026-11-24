@@ -36,7 +36,9 @@ def nombre_clase(c: dict) -> str:
 
 
 def libres(clase: dict) -> int:
-  n = supabase.table("reservas").select("id", count="exact").eq("clase_id", clase["id"]).neq("estatus", "Cancelada").execute().count or 0
+  # Un No Show (no llegó) deja libre su lugar: antes solo se descontaban las canceladas y la fila nunca se podía mover
+  n = supabase.table("reservas").select("id", count="exact").eq("clase_id", clase["id"])\
+    .not_.in_("estatus", ["Cancelada", "Cancelado", "No Show"]).execute().count or 0
   return max(0, (clase.get("capacidad_max") or 0) - n)
 
 
