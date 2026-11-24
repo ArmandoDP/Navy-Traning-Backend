@@ -636,3 +636,203 @@ async def bitacora(request: Request, sucursal_id: str | None = None, desde: str 
   return {"tolerancia": tolerancia, "desde": d1.isoformat(), "hasta": d2.isoformat(),
           "incidencias": incidencias,
           "personas": sorted(resumen.values(), key=lambda r: (-r["faltas"], -r["retardos"], r["nombre"]))}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parte 3: tarifas por clase, sueldos por puesto y reglas de bono (solo Dirección)
+# ══════════════════════════════════════════════════════════════════════════════
+NIVELES = ["Seal", "Marine", "Elite", "Coach de Piso"]
+PUESTOS_FIJO = ["Front", "The Galley", "Manager", "Submanager", "Regional", "Staff general"]
+DURACIONES_BASE = [60, 70, 85, 90]
+
+
+def _hoy() -> str:
+  return _ahora().astimezone(CDMX).date().isoformat()
+
+
+def _vigentes(filas: list, clave) -> dict:
+  """De varias versiones de la misma regla, la vigente hoy (la más reciente que ya empezó)."""
+  hoy, mejor = _hoy(), {}
+  for f in sorted(filas, key=lambda f: f["vigente_desde"], reverse=True):
+    if f["vigente_desde"] <= hoy:
+      mejor.setdefault(clave(f), f)
+  return mejor
+
+
+def _duraciones_en_uso() -> list[int]:
+  desde = (_ahora() - timedelta(days=60)).isoformat()
+  filas = supabase.table("clases").select("duracion_minutos, nombre_clase").gte("horario", desde)\
+    .neq("estado", "Cancelada").limit(5000).execute().data or []
+  return sorted({f["duracion_minutos"] for f in filas if f.get("duracion_minutos") and not _es_open_gym(f.get("nombre_clase"))})
+
+
+# ── Tarifas por clase ────────────────────────────────────────────────────────
+@router.get("/tarifas")
+async def ver_tarifas(request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  filas = supabase.table("tarifas_coach").select("id, sucursal_id, nivel, duracion_minutos, modo, monto, vigente_desde")\
+    .eq("activo", True).is_("tipo_clase", "null").execute().data or []
+  vig = _vigentes(filas, lambda f: (f["nivel"], f.get("duracion_minutos"), f.get("sucursal_id")))
+  en_uso = _duraciones_en_uso()
+  return {
+    "niveles": NIVELES,
+    "duraciones": sorted(set(DURACIONES_BASE) | set(en_uso)),
+    "duraciones_en_uso": en_uso,
+    "tarifas": [{"nivel": k[0], "duracion": k[1], "sucursal_id": k[2], "monto": float(f["monto"]),
+                 "modo": f["modo"], "vigente_desde": f["vigente_desde"]} for k, f in vig.items()],
+  }
+
+
+class TarifaIn(BaseModel):
+  nivel: str
+  duracion: int
+  sucursal_id: str | None = None
+  monto: float | None = None      # None = quitar (en una sucursal, vuelve a usar la general)
+
+
+@router.put("/tarifas")
+async def guardar_tarifa(body: TarifaIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  if body.monto is not None and body.monto < 0:
+    raise HTTPException(status_code=400, detail="El monto no puede ser negativo.")
+  q = supabase.table("tarifas_coach").select("id, vigente_desde").eq("nivel", body.nivel)\
+    .eq("duracion_minutos", body.duracion).eq("activo", True).is_("tipo_clase", "null")
+  q = q.eq("sucursal_id", body.sucursal_id) if body.sucursal_id else q.is_("sucursal_id", "null")
+  existentes = q.execute().data or []
+  hoy = _hoy()
+  if body.monto is None:
+    # Se desactiva de hoy en adelante; lo ya pagado no cambia (va congelado en cada clase)
+    for f in existentes:
+      supabase.table("tarifas_coach").update({"activo": False}).eq("id", f["id"]).execute()
+    return {"ok": True}
+  de_hoy = [f for f in existentes if f["vigente_desde"] == hoy]
+  if de_hoy:
+    supabase.table("tarifas_coach").update({"monto": body.monto, "modo": "por_clase"}).eq("id", de_hoy[0]["id"]).execute()
+  else:
+    # Nueva versión desde hoy: las clases anteriores conservan la tarifa que tenían
+    supabase.table("tarifas_coach").insert({
+      "nivel": body.nivel, "duracion_minutos": body.duracion, "sucursal_id": body.sucursal_id,
+      "modo": "por_clase", "monto": body.monto, "vigente_desde": hoy, "activo": True, "creado_por": s["id"],
+    }).execute()
+  return {"ok": True}
+
+
+# ── Sueldos por puesto y sucursal ────────────────────────────────────────────
+@router.get("/sueldos")
+async def ver_sueldos(request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  filas = supabase.table("sueldos_puesto").select("id, puesto, sucursal_id, monto_quincenal, vigente_desde")\
+    .eq("activo", True).execute().data or []
+  vig = _vigentes(filas, lambda f: (f["puesto"], f.get("sucursal_id")))
+  conteo: dict[str, int] = {}
+  for st in supabase.table("staff").select("tipo").eq("estatus", "Activo").in_("tipo_pago", ["Fijo", "Fijo + clases"]).execute().data or []:
+    conteo[st.get("tipo") or "Staff general"] = conteo.get(st.get("tipo") or "Staff general", 0) + 1
+  return {"puestos": PUESTOS_FIJO, "personas_por_puesto": conteo,
+          "sueldos": [{"puesto": k[0], "sucursal_id": k[1], "monto": float(f["monto_quincenal"]),
+                       "vigente_desde": f["vigente_desde"]} for k, f in vig.items()]}
+
+
+class SueldoIn(BaseModel):
+  puesto: str
+  sucursal_id: str | None = None
+  monto: float | None = None
+
+
+@router.put("/sueldos")
+async def guardar_sueldo(body: SueldoIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  if body.monto is not None and body.monto < 0:
+    raise HTTPException(status_code=400, detail="El monto no puede ser negativo.")
+  q = supabase.table("sueldos_puesto").select("id, vigente_desde").eq("puesto", body.puesto).eq("activo", True)
+  q = q.eq("sucursal_id", body.sucursal_id) if body.sucursal_id else q.is_("sucursal_id", "null")
+  existentes = q.execute().data or []
+  hoy = _hoy()
+  if body.monto is None:
+    for f in existentes:
+      supabase.table("sueldos_puesto").update({"activo": False}).eq("id", f["id"]).execute()
+    return {"ok": True}
+  de_hoy = [f for f in existentes if f["vigente_desde"] == hoy]
+  if de_hoy:
+    supabase.table("sueldos_puesto").update({"monto_quincenal": body.monto}).eq("id", de_hoy[0]["id"]).execute()
+  else:
+    supabase.table("sueldos_puesto").insert({
+      "puesto": body.puesto, "sucursal_id": body.sucursal_id, "monto_quincenal": body.monto,
+      "vigente_desde": hoy, "activo": True, "creado_por": s["id"],
+    }).execute()
+  return {"ok": True}
+
+
+# ── Reglas de bono ───────────────────────────────────────────────────────────
+class ReglaIn(BaseModel):
+  nombre: str
+  monto: float
+  niveles: list[str] | None = None
+  sucursal_ids: list[str] | None = None
+  tipos_clase: list[str] | None = None
+  duraciones: list[int] | None = None
+  dias_semana: list[int] | None = None
+  hora_desde: str | None = None
+  hora_hasta: str | None = None
+  min_asistentes: int | None = None
+  min_ocupacion_pct: int | None = None
+  acumulable: bool = False
+  vigente_desde: str | None = None
+  vigente_hasta: str | None = None
+
+
+def _regla_limpia(b: ReglaIn) -> dict:
+  if not b.nombre.strip():
+    raise HTTPException(status_code=400, detail="Ponle nombre a la regla.")
+  if b.monto <= 0:
+    raise HTTPException(status_code=400, detail="El monto del bono debe ser mayor a 0.")
+  if b.min_asistentes is None and b.min_ocupacion_pct is None:
+    raise HTTPException(status_code=400, detail="Pon un mínimo de asistentes o de ocupación: el bono es por cuántos llegaron.")
+  if b.hora_desde and b.hora_hasta and b.hora_hasta <= b.hora_desde:
+    raise HTTPException(status_code=400, detail="La hora final debe ser después de la inicial.")
+  vacio = lambda x: x if x else None
+  return {
+    "nombre": b.nombre.strip(), "monto": b.monto, "niveles": vacio(b.niveles), "sucursal_ids": vacio(b.sucursal_ids),
+    "tipos_clase": vacio(b.tipos_clase), "duraciones": vacio(b.duraciones), "dias_semana": vacio(b.dias_semana),
+    "hora_desde": b.hora_desde or None, "hora_hasta": b.hora_hasta or None,
+    "min_asistentes": b.min_asistentes, "min_ocupacion_pct": b.min_ocupacion_pct, "acumulable": b.acumulable,
+    "vigente_desde": b.vigente_desde or _hoy(), "vigente_hasta": b.vigente_hasta or None,
+  }
+
+
+@router.get("/bonos")
+async def ver_bonos(request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  reglas = supabase.table("reglas_bono").select("*").eq("activo", True).order("created_at").execute().data or []
+  desde = (_ahora() - timedelta(days=60)).isoformat()
+  tipos = sorted({(f.get("tipo_clase") or "").strip() for f in supabase.table("clases").select("tipo_clase")
+                  .gte("horario", desde).limit(5000).execute().data or [] if (f.get("tipo_clase") or "").strip()})
+  return {"reglas": reglas, "niveles": NIVELES, "tipos_clase": tipos, "duraciones": _duraciones_en_uso()}
+
+
+@router.post("/bonos")
+async def crear_bono(body: ReglaIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  supabase.table("reglas_bono").insert({**_regla_limpia(body), "creado_por": s["id"]}).execute()
+  return {"ok": True}
+
+
+@router.put("/bonos/{regla_id}")
+async def editar_bono(regla_id: str, body: ReglaIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  supabase.table("reglas_bono").update({**_regla_limpia(body), "updated_at": _ahora().isoformat()}).eq("id", regla_id).execute()
+  return {"ok": True}
+
+
+@router.delete("/bonos/{regla_id}")
+async def borrar_bono(regla_id: str, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  supabase.table("reglas_bono").update({"activo": False, "updated_at": _ahora().isoformat()}).eq("id", regla_id).execute()
+  return {"ok": True}
