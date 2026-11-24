@@ -10,6 +10,7 @@ from routers.checador import generar_clases_impartidas, cerrar_salidas_olvidadas
 from routers.totalpass_booking import reintentar_totalpass_pendientes
 from routers.staff_admin import router as staff_admin_router
 from routers.cambio_coach import router as cambio_coach_router
+from routers.fitpass import router as fitpass_router
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.pausas import reanudar_pausas_vencidas
 from services.planes import avanzar_planes
@@ -86,6 +87,7 @@ app.include_router(checador.router,          prefix="/checador")           # che
 app.include_router(confirmar_reserva.router)                               # sin prefix
 app.include_router(staff_admin_router, prefix="/staff-admin")
 app.include_router(cambio_coach_router, prefix="/cambio-coach")
+app.include_router(fitpass_router, prefix="/fitpass")
 
 # Scheduler (horas en UTC: CDMX = UTC-6)
 scheduler = AsyncIOScheduler()
