@@ -95,16 +95,19 @@ async def opciones(clase_id: str, request: Request):
     lista.append({"id": x["id"], "nombre": _nombre(x), "nivel": x.get("nivel"), "tiene_correo": bool(x.get("email")),
                   "de_la_sucursal": c["sucursal_id"] in sucs, "ocupado": x["id"] in ocupados})
   lista.sort(key=lambda x: (x["ocupado"], not x["de_la_sucursal"], x["nombre"]))
-  historial = supabase.table("cambios_coach")\
-    .select("motivo, detalle, created_at, antes:coach_antes(nombre, primer_apellido), despues:coach_despues(nombre, primer_apellido), quien:hecho_por(nombre, primer_apellido)")\
+  # Sin "embeds": hecho_por no tiene llave foránea, así que los nombres se buscan aparte
+  historial = supabase.table("cambios_coach").select("motivo, detalle, created_at, coach_antes, coach_despues, hecho_por")\
     .eq("clase_id", clase_id).order("created_at", desc=True).execute().data or []
+  ids = {h[k] for h in historial for k in ("coach_antes", "coach_despues", "hecho_por") if h.get(k)}
+  nombres = {x["id"]: x for x in (supabase.table("staff").select("id, nombre, primer_apellido").in_("id", list(ids)).execute().data or [])} if ids else {}
   return {
     "clase": {"nombre": (c.get("nombre_clase") or "").strip(), "cuando": _cuando(c),
               "sucursal": (c.get("sucursales") or {}).get("nombre"), "coach_id": c.get("coach_id")},
     "motivos": MOTIVOS, "coaches": lista,
     "historial": [{"motivo": h["motivo"], "detalle": h.get("detalle"), "fecha": h["created_at"],
-                   "antes": _nombre(h.get("antes")) or "Sin coach", "despues": _nombre(h.get("despues")),
-                   "quien": _nombre(h.get("quien"))} for h in historial],
+                   "antes": _nombre(nombres.get(h.get("coach_antes"))) or "Sin coach",
+                   "despues": _nombre(nombres.get(h.get("coach_despues"))),
+                   "quien": _nombre(nombres.get(h.get("hecho_por")))} for h in historial],
     "quincena_cerrada": _quincena_cerrada(c),
   }
 
