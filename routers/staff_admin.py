@@ -559,6 +559,10 @@ async def bitacora(request: Request, sucursal_id: str | None = None, desde: str 
   s = _admin(request)
   alcance = _alcance(s, sucursal_id)
   ini, fin, d1, d2 = _rango(desde, hasta)
+  return _bitacora_datos(alcance, ini, fin, d1, d2)
+
+
+def _bitacora_datos(alcance: set | None, ini: datetime, fin: datetime, d1: date, d2: date) -> dict:
   tolerancia = int(_config("tolerancia_retardo_min", 10))
   ahora = _ahora()
   hoy = ahora.astimezone(CDMX).date()
@@ -575,9 +579,9 @@ async def bitacora(request: Request, sucursal_id: str | None = None, desde: str 
   staff = {f["id"]: f for f in supabase.table("staff").select("id, nombre, primer_apellido, estatus")
            .in_("id", list(ids)).execute().data or []}
   sucs = {f["id"]: f["nombre"] for f in supabase.table("sucursales").select("id, nombre").execute().data or []}
-  fest = supabase.table("dias_festivos").select("fecha, nombre, sucursal_id").eq("activo", True)\
+  fest = supabase.table("dias_festivos").select("fecha, nombre, sucursal_id, multiplicador").eq("activo", True)\
     .gte("fecha", d1.isoformat()).lte("fecha", d2.isoformat()).execute().data or []
-  festivos = {(f["fecha"], f.get("sucursal_id")): f["nombre"] for f in fest}
+  festivos = {(f["fecha"], f.get("sucursal_id")): f for f in fest}
 
   entradas: dict[tuple, datetime] = {}
   for c in supabase.table("checadas").select("staff_id, sucursal_id, registrado_at")\
@@ -609,7 +613,8 @@ async def bitacora(request: Request, sucursal_id: str | None = None, desde: str 
               "llegada": llegada.isoformat() if llegada else None}
       if festivo:
         if llegada:
-          incidencias.append({**base, "tipo": "festivo_trabajado", "detalle": festivo, "minutos": 0})
+          incidencias.append({**base, "tipo": "festivo_trabajado", "detalle": festivo["nombre"], "minutos": 0,
+                              "multiplicador": float(festivo.get("multiplicador") or 3)})
         continue
       if not llegada:
         if d == hoy and ahora < programada + timedelta(minutes=tolerancia):
@@ -836,3 +841,601 @@ async def borrar_bono(regla_id: str, request: Request):
   _solo_direccion(s)
   supabase.table("reglas_bono").update({"activo": False, "updated_at": _ahora().isoformat()}).eq("id", regla_id).execute()
   return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parte 4: quincena (cálculo, pendientes, aprobación, ajustes, recálculo, cierre y Excel)
+# ══════════════════════════════════════════════════════════════════════════════
+import io
+from fastapi.responses import StreamingResponse
+
+
+def _quincena_de(inicio: str | None) -> tuple[date, date]:
+  """(inicio, fin exclusivo) de la quincena. Sin inicio: la actual."""
+  if inicio:
+    d = date.fromisoformat(inicio)
+    d = d.replace(day=1 if d.day <= 15 else 16)
+  else:
+    hoy = _ahora().astimezone(CDMX).date()
+    d = hoy.replace(day=1 if hoy.day <= 15 else 16)
+  fin = d.replace(day=16) if d.day == 1 else (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+  return d, fin
+
+
+def _utc(d: date) -> datetime:
+  return datetime(d.year, d.month, d.day, tzinfo=CDMX).astimezone(timezone.utc)
+
+
+def _registro_quincena(d1: date, d2: date) -> dict:
+  fila = supabase.table("quincenas").select("*").eq("inicio", d1.isoformat()).limit(1).execute().data
+  if fila:
+    return fila[0]
+  supabase.table("quincenas").upsert({"inicio": d1.isoformat(), "fin": d2.isoformat()}, on_conflict="inicio").execute()
+  return {"inicio": d1.isoformat(), "fin": d2.isoformat(), "estado": "abierta"}
+
+
+def _sueldo_fijo(st: dict, sucursal_id: str | None, fecha: str, sueldos: list) -> float | None:
+  if st.get("sueldo_fijo"):
+    return float(st["sueldo_fijo"])
+  puesto = st.get("tipo") or "Staff general"
+  for suc in ([sucursal_id] if sucursal_id else []) + [None]:
+    vig = [x for x in sueldos if x["puesto"] == puesto and x.get("sucursal_id") == suc and x["vigente_desde"] <= fecha]
+    if vig:
+      return float(max(vig, key=lambda x: x["vigente_desde"])["monto_quincenal"])
+  return None
+
+
+def _calcular_quincena(d1: date, d2: date, alcance: set | None) -> dict:
+  ini, fin = _utc(d1), _utc(d2)
+  ultimo = (d2 - timedelta(days=1)).isoformat()
+  dias_q = (d2 - d1).days
+
+  staff = supabase.table("staff").select(
+    "id, nombre, primer_apellido, segundo_apellido, tipo, nivel, tipo_pago, sueldo_fijo, tarifa_hora, estatus, "
+    "fecha_ingreso, sucursal_asignada_id, pago_en_efectivo, staff_sucursales(sucursal_id)").execute().data or []
+  por_id = {x["id"]: x for x in staff}
+  sucs = {x["id"]: x["nombre"] for x in supabase.table("sucursales").select("id, nombre").execute().data or []}
+  sueldos = supabase.table("sueldos_puesto").select("puesto, sucursal_id, monto_quincenal, vigente_desde").eq("activo", True).execute().data or []
+
+  def suc_de(x: dict) -> str | None:
+    return x.get("sucursal_asignada_id") or next((y["sucursal_id"] for y in x.get("staff_sucursales") or []), None)
+
+  def nombre(x: dict) -> str:
+    return " ".join(p for p in [x.get("nombre"), x.get("primer_apellido"), x.get("segundo_apellido")] if p).strip()
+
+  def esquema(x: dict) -> str:
+    return x.get("tipo_pago") or ("Por clase" if (x.get("tipo") or "") == "Coach" else "Fijo")
+
+  # Clases de la quincena
+  qi = supabase.table("clases_impartidas").select("*").gte("horario", ini.isoformat()).lt("horario", fin.isoformat())\
+    .order("horario").limit(20000)
+  if alcance is not None:
+    qi = qi.in_("sucursal_id", list(alcance))
+  imp = qi.execute().data or []
+
+  # Checadas (días, horas y festivos trabajados)
+  qc = supabase.table("checadas").select("staff_id, sucursal_id, tipo, estado, registrado_at")\
+    .gte("registrado_at", ini.isoformat()).lt("registrado_at", fin.isoformat()).neq("estado", "rechazada")\
+    .order("registrado_at").limit(20000)
+  if alcance is not None:
+    qc = qc.in_("sucursal_id", list(alcance))
+  checadas = qc.execute().data or []
+  fest = supabase.table("dias_festivos").select("fecha, nombre, sucursal_id, multiplicador").eq("activo", True)\
+    .gte("fecha", d1.isoformat()).lte("fecha", ultimo).execute().data or []
+
+  trabajo: dict[str, dict] = {}
+  abiertas: dict[str, datetime] = {}
+  for c in checadas:
+    t = trabajo.setdefault(c["staff_id"], {"dias": set(), "minutos": 0.0, "festivos": {}, "sucursales": set()})
+    h = _dt(c["registrado_at"])
+    dia = h.astimezone(CDMX).date().isoformat()
+    t["sucursales"].add(c["sucursal_id"])
+    if c["tipo"] == "entrada" and c["estado"] in ("confirmada", "automatica", "manual"):
+      abiertas[c["staff_id"]] = h
+      t["dias"].add(dia)
+      for f in fest:
+        if f["fecha"] == dia and f.get("sucursal_id") in (None, c["sucursal_id"]):
+          t["festivos"][dia] = {"nombre": f["nombre"], "multiplicador": float(f.get("multiplicador") or 3)}
+    elif c["tipo"] == "salida" and c["staff_id"] in abiertas:
+      t["minutos"] += (h - abiertas.pop(c["staff_id"])).total_seconds() / 60
+
+  bit = _bitacora_datos(alcance, ini, fin, d1, d2 - timedelta(days=1))
+  incid = {p["staff_id"]: p for p in bit["personas"]}
+
+  ajq = supabase.table("ajustes_pago").select("id, staff_id, sucursal_id, tipo, concepto, monto, creado_por, created_at")\
+    .eq("quincena_inicio", d1.isoformat()).eq("activo", True)
+  ajustes = ajq.execute().data or []
+  if alcance is not None:
+    ajustes = [a for a in ajustes if a.get("sucursal_id") in alcance or suc_de(por_id.get(a["staff_id"], {})) in alcance]
+  quien = _nombres({a.get("creado_por") for a in ajustes})
+
+  personas: dict[str, dict] = {}
+
+  def persona(sid: str) -> dict:
+    x = por_id.get(sid, {})
+    return personas.setdefault(sid, {
+      "staff_id": sid, "nombre": nombre(x) or "(sin nombre)", "puesto": x.get("tipo") or "Staff general",
+      "nivel": x.get("nivel"), "esquema": esquema(x), "sucursal": sucs.get(suc_de(x) or ""),
+      "estatus": x.get("estatus") or "Activo", "efectivo": bool(x.get("pago_en_efectivo")),
+      "clases": 0, "suplencias": 0, "asistentes": 0, "por_revisar": 0, "monto_clases": 0.0, "bonos": 0.0,
+      "sueldo": 0.0, "horas": 0.0, "dias": 0, "festivos": 0, "pago_festivos": 0.0,
+      "faltas": 0, "retardos": 0, "minutos_tarde": 0, "ajustes": 0.0, "detalle_ajustes": [],
+      "detalle_clases": [], "avisos": [], "total": 0.0,
+    })
+
+  for c in imp:
+    if c["estado"] == "no_aplica" or not c.get("coach_id"):
+      continue
+    p = persona(c["coach_id"])
+    linea = {"id": c["id"], "clase_id": c["clase_id"], "horario": c["horario"], "clase": c.get("nombre_clase"),
+             "sucursal": sucs.get(c["sucursal_id"]), "duracion": c.get("duracion_minutos"), "asistentes": c.get("asistentes") or 0,
+             "nivel": c.get("nivel_coach"), "tarifa": float(c["tarifa_hora"]) if c.get("tarifa_hora") is not None else None,
+             "porcentaje": float(c.get("porcentaje_pago") or 100), "suplencia": bool(c.get("es_suplencia")),
+             "bonos": c.get("bonos_detalle") or [], "monto_clase": float(c.get("monto_clase") or 0),
+             "bono": float(c.get("bono") or 0), "total": float(c.get("total") or 0),
+             "estado": c["estado"], "motivo": c.get("motivo_estado")}
+    p["detalle_clases"].append(linea)
+    if c["estado"] == "impartida":
+      p["clases"] += 1
+      p["asistentes"] += linea["asistentes"]
+      p["monto_clases"] += linea["monto_clase"]
+      p["bonos"] += linea["bono"]
+      p["suplencias"] += 1 if linea["suplencia"] else 0
+    else:
+      p["por_revisar"] += 1
+
+  # Staff con sueldo fijo o por hora (en el alcance)
+  for x in staff:
+    es = esquema(x)
+    if es == "Por clase":
+      continue
+    suc = suc_de(x)
+    tiene_actividad = x["id"] in trabajo
+    if alcance is not None and suc not in alcance and not (tiene_actividad and trabajo[x["id"]]["sucursales"] & alcance):
+      continue
+    if (x.get("estatus") or "Activo") != "Activo" and not tiene_actividad:
+      continue
+    p = persona(x["id"])
+    t = trabajo.get(x["id"], {"dias": set(), "minutos": 0, "festivos": {}})
+    p["dias"], p["horas"] = len(t["dias"]), round(t["minutos"] / 60, 1)
+    if es.startswith("Fijo"):
+      base = _sueldo_fijo(x, suc, ultimo, sueldos)
+      if base is None:
+        p["avisos"].append("sin_sueldo")
+        base = 0.0
+      # Ingresó a media quincena: proporcional a los días
+      if x.get("fecha_ingreso") and d1.isoformat() < x["fecha_ingreso"] <= ultimo:
+        dias_trab = (d2 - date.fromisoformat(x["fecha_ingreso"])).days
+        base = base * dias_trab / dias_q
+        p["avisos"].append("ingreso_en_quincena")
+      p["sueldo"] = round(base, 2)
+      diario = base / 15 if base else 0
+      p["festivos"] = len(t["festivos"])
+      p["pago_festivos"] = round(sum(diario * (f["multiplicador"] - 1) for f in t["festivos"].values()), 2)
+    elif es == "Por hora":
+      tarifa = float(x.get("tarifa_hora") or 0)
+      if not tarifa:
+        p["avisos"].append("sin_tarifa_hora")
+      p["sueldo"] = round(p["horas"] * tarifa, 2)
+    if (x.get("estatus") or "Activo") != "Activo":
+      p["avisos"].append("inactivo_con_checadas")
+    i = incid.get(x["id"])
+    if i:
+      p["faltas"], p["retardos"], p["minutos_tarde"] = i["faltas"], i["retardos"], i["minutos_tarde"]
+
+  for a in ajustes:
+    p = persona(a["staff_id"])
+    monto = float(a["monto"]) * (1 if a["tipo"] == "bono" else -1)
+    p["ajustes"] += monto
+    p["detalle_ajustes"].append({"id": a["id"], "tipo": a["tipo"], "concepto": a["concepto"], "monto": float(a["monto"]),
+                                 "capturo": quien.get(a.get("creado_por")), "fecha": a["created_at"]})
+
+  for p in personas.values():
+    for k in ("monto_clases", "bonos", "ajustes"):
+      p[k] = round(p[k], 2)
+    p["total"] = round(p["sueldo"] + p["pago_festivos"] + p["monto_clases"] + p["bonos"] + p["ajustes"], 2)
+    p["asistentes_promedio"] = round(p["asistentes"] / p["clases"], 1) if p["clases"] else None
+    x = por_id.get(p["staff_id"], {})
+    if p["esquema"] in ("Por clase", "Fijo + clases") and (p["clases"] or p["por_revisar"]) and not x.get("nivel"):
+      p["avisos"].append("sin_nivel")
+
+  lista = sorted(personas.values(), key=lambda p: p["nombre"])
+  coaches = [p for p in lista if p["esquema"] in ("Por clase", "Fijo + clases") or p["clases"] or p["por_revisar"]]
+  ids_coach = {p["staff_id"] for p in coaches}
+  staff_l = [p for p in lista if p["staff_id"] not in ids_coach]
+
+  # Pendientes que bloquean el cierre
+  pendientes = []
+  for p in lista:
+    for l in p["detalle_clases"]:
+      if l["estado"] in ("revisar", "sin_checar"):
+        pendientes.append({"tipo": "clase", "id": l["id"], "staff_id": p["staff_id"], "persona": p["nombre"],
+                           "texto": f"{l['clase']} · {l['sucursal']}", "horario": l["horario"],
+                           "motivo": l.get("motivo") or ("No checó entrada" if l["estado"] == "sin_checar" else "Por revisar")})
+    for a in p["avisos"]:
+      if a in ("sin_sueldo", "sin_nivel", "sin_tarifa_hora"):
+        pendientes.append({"tipo": a, "staff_id": p["staff_id"], "persona": p["nombre"],
+                           "texto": {"sin_sueldo": "No tiene sueldo capturado (ni propio ni de su puesto)",
+                                     "sin_nivel": "Da clases y no tiene nivel",
+                                     "sin_tarifa_hora": "Cobra por hora y no tiene tarifa"}[a]})
+  sin_coach = [c for c in imp if not c.get("coach_id") and c["estado"] in ("revisar", "sin_checar")]
+  for c in sin_coach:
+    pendientes.append({"tipo": "clase", "id": c["id"], "staff_id": None, "persona": "Sin coach",
+                       "texto": f"{c.get('nombre_clase')} · {sucs.get(c['sucursal_id'])}", "horario": c["horario"],
+                       "motivo": c.get("motivo_estado") or "Clase sin coach asignado"})
+  qp = supabase.table("checadas").select("id, staff:staff_id(nombre, primer_apellido), registrado_at")\
+    .eq("estado", "pendiente").gte("registrado_at", ini.isoformat()).lt("registrado_at", fin.isoformat())
+  if alcance is not None:
+    qp = qp.in_("sucursal_id", list(alcance))
+  for c in qp.execute().data or []:
+    st = c.get("staff") or {}
+    pendientes.append({"tipo": "checada_pendiente", "persona": f"{st.get('nombre') or ''} {st.get('primer_apellido') or ''}".strip(),
+                       "texto": "Entrada sin confirmar en Front Desk", "horario": c["registrado_at"]})
+
+  totales = {
+    "coaches": round(sum(p["total"] for p in coaches), 2),
+    "staff": round(sum(p["total"] for p in staff_l), 2),
+    "bonos": round(sum(p["bonos"] for p in lista), 2),
+    "festivos": round(sum(p["pago_festivos"] for p in lista), 2),
+    "ajustes": round(sum(p["ajustes"] for p in lista), 2),
+    "clases": sum(p["clases"] for p in lista),
+    "personas": len(lista),
+  }
+  totales["total"] = round(totales["coaches"] + totales["staff"], 2)
+  # Sucursales con actividad (para las aprobaciones)
+  activas = sorted({c["sucursal_id"] for c in imp} | {c["sucursal_id"] for c in checadas}
+                   | {suc_de(por_id[p["staff_id"]]) for p in staff_l if p["staff_id"] in por_id} - {None})
+  if alcance is not None:
+    activas = [x for x in activas if x in alcance]
+  return {"coaches": coaches, "staff": staff_l, "totales": totales, "pendientes": pendientes,
+          "sucursales": [{"id": x, "nombre": sucs.get(x)} for x in activas], "tolerancia": bit["tolerancia"]}
+
+
+@router.get("/quincena")
+async def ver_quincena(request: Request, inicio: str | None = None, sucursal_id: str | None = None):
+  s = _admin(request)
+  alcance = _alcance(s, sucursal_id)
+  d1, d2 = _quincena_de(inicio)
+  reg = _registro_quincena(d1, d2)
+  if reg["estado"] == "cerrada" and reg.get("snapshot"):
+    datos = reg["snapshot"]
+    if alcance is not None:                       # un Manager ve solo lo suyo de la foto
+      permitidas = {x["nombre"] for x in (supabase.table("sucursales").select("nombre").in_("id", list(alcance)).execute().data or [])}
+      filtra = lambda l: [p for p in l if p.get("sucursal") in permitidas or any(c.get("sucursal") in permitidas for c in p.get("detalle_clases", []))]
+      datos = {**datos, "coaches": filtra(datos["coaches"]), "staff": filtra(datos["staff"])}
+  else:
+    datos = _calcular_quincena(d1, d2, alcance)
+  aprob = supabase.table("quincena_aprobaciones").select("sucursal_id, aprobado_por, aprobado_at")\
+    .eq("quincena_inicio", d1.isoformat()).execute().data or []
+  quien = _nombres({a["aprobado_por"] for a in aprob} | {reg.get("cerrada_por")})
+  hoy = _ahora().astimezone(CDMX).date()
+  return {
+    **datos, "inicio": d1.isoformat(), "fin": d2.isoformat(), "estado": reg["estado"],
+    "cerrada_por": quien.get(reg.get("cerrada_por")), "cerrada_at": reg.get("cerrada_at"),
+    "en_curso": d1 <= hoy < d2, "puede_cerrar": hoy >= d2 - timedelta(days=1),
+    "aprobaciones": [{"sucursal_id": a["sucursal_id"], "por": quien.get(a["aprobado_por"]), "at": a["aprobado_at"]} for a in aprob],
+    "es_direccion": _es_direccion(s), "puede_ver_banco": _es_direccion(s),
+  }
+
+
+def _abierta(d1: date) -> None:
+  fila = supabase.table("quincenas").select("estado").eq("inicio", d1.isoformat()).limit(1).execute().data
+  if fila and fila[0]["estado"] == "cerrada":
+    raise HTTPException(status_code=400, detail="Esa quincena ya está cerrada. Los cambios van como ajuste en la siguiente.")
+
+
+class InicioIn(BaseModel):
+  inicio: str
+  sucursal_id: str | None = None
+
+
+@router.post("/quincena/recalcular")
+async def recalcular_quincena(body: InicioIn, request: Request):
+  """Vuelve a evaluar las clases de la quincena que no estén resueltas a mano (por ejemplo, después de capturar tarifas)."""
+  s = _admin(request)
+  _solo_direccion(s)
+  d1, d2 = _quincena_de(body.inicio)
+  _abierta(d1)
+  from routers.checador import _evaluar_clase
+  ahora = _ahora()
+  clases = supabase.table("clases")\
+    .select("id, coach_id, sucursal_id, horario, duracion_minutos, nombre_clase, tipo_clase, estado, capacidad_max")\
+    .gte("horario", _utc(d1).isoformat()).lt("horario", min(_utc(d2), ahora).isoformat())\
+    .neq("estado", "Cancelada").limit(10000).execute().data or []
+  listas = [c for c in clases if _dt(c["horario"]) + timedelta(minutes=(c.get("duracion_minutos") or 60) + 30) <= ahora]
+  resueltas = set()
+  ids = [c["id"] for c in listas]
+  for i in range(0, len(ids), 200):
+    for f in supabase.table("clases_impartidas").select("clase_id, resuelto_por").in_("clase_id", ids[i:i + 200]).execute().data or []:
+      if f.get("resuelto_por"):
+        resueltas.add(f["clase_id"])
+  n = errores = 0
+  for c in listas:
+    if c["id"] in resueltas:
+      continue
+    try:
+      supabase.table("clases_impartidas").upsert(_evaluar_clase(c), on_conflict="clase_id").execute()
+      n += 1
+    except Exception as e:
+      errores += 1
+      print(f"⚠️ recalcular {c['id']}: {e}")
+  return {"ok": True, "recalculadas": n, "errores": errores, "resueltas_a_mano": len(resueltas)}
+
+
+class ResolverIn(BaseModel):
+  accion: str            # pagar | no_pagar
+  motivo: str
+  monto: float | None = None    # al pagar: si no hay tarifa, el monto que se paga
+
+
+@router.post("/quincena/clases/{impartida_id}/resolver")
+async def resolver_clase(impartida_id: str, body: ResolverIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  if len(body.motivo.strip()) < 5:
+    raise HTTPException(status_code=400, detail="Escribe el motivo.")
+  fila = supabase.table("clases_impartidas").select("*").eq("id", impartida_id).limit(1).execute().data
+  if not fila:
+    raise HTTPException(status_code=404, detail="No existe esa clase.")
+  c = fila[0]
+  d1, _ = _quincena_de(_dt(c["horario"]).astimezone(CDMX).date().isoformat())
+  _abierta(d1)
+  antes = {"estado": c["estado"], "monto_clase": c.get("monto_clase"), "total": c.get("total")}
+  cambios = {"resuelto_por": s["id"], "resuelto_at": _ahora().isoformat(), "motivo_estado": f"Resuelto por Dirección: {body.motivo.strip()}"}
+  if body.accion == "no_pagar":
+    cambios.update({"estado": "no_aplica", "monto_clase": 0, "bono": 0, "total": 0, "bonos_detalle": []})
+  elif body.accion == "pagar":
+    if not c.get("coach_id"):
+      raise HTTPException(status_code=400, detail="La clase no tiene coach: asígnalo primero en la clase.")
+    monto = float(c.get("monto_clase") or 0)
+    if body.monto is not None:
+      monto = float(body.monto)
+    if monto <= 0:
+      raise HTTPException(status_code=400, detail="Esta clase no tiene tarifa: escribe el monto a pagar o captura la tarifa y recalcula.")
+    cambios.update({"estado": "impartida", "monto_clase": monto, "total": round(monto + float(c.get("bono") or 0), 2)})
+  else:
+    raise HTTPException(status_code=400, detail="Acción inválida.")
+  supabase.table("clases_impartidas").update(cambios).eq("id", impartida_id).execute()
+  supabase.table("correcciones").insert({
+    "tabla": "clases_impartidas", "registro_id": impartida_id, "campo": "resolver",
+    "valor_antes": antes, "valor_despues": {k: cambios[k] for k in ("estado", "monto_clase", "total") if k in cambios},
+    "motivo": body.motivo.strip(), "hecho_por": s["id"],
+  }).execute()
+  return {"ok": True}
+
+
+@router.post("/quincena/aprobar")
+async def aprobar_sucursal(body: InicioIn, request: Request):
+  s = _admin(request)
+  if not body.sucursal_id:
+    raise HTTPException(status_code=400, detail="Falta la sucursal.")
+  _alcance(s, body.sucursal_id)
+  d1, d2 = _quincena_de(body.inicio)
+  _registro_quincena(d1, d2)
+  _abierta(d1)
+  supabase.table("quincena_aprobaciones").upsert({
+    "quincena_inicio": d1.isoformat(), "sucursal_id": body.sucursal_id,
+    "aprobado_por": s["id"], "aprobado_at": _ahora().isoformat(),
+  }, on_conflict="quincena_inicio,sucursal_id").execute()
+  return {"ok": True}
+
+
+@router.post("/quincena/desaprobar")
+async def desaprobar_sucursal(body: InicioIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  d1, _ = _quincena_de(body.inicio)
+  _abierta(d1)
+  supabase.table("quincena_aprobaciones").delete().eq("quincena_inicio", d1.isoformat()).eq("sucursal_id", body.sucursal_id).execute()
+  return {"ok": True}
+
+
+class AjusteIn(BaseModel):
+  staff_id: str
+  inicio: str
+  tipo: str
+  concepto: str
+  monto: float
+  sucursal_id: str | None = None
+
+
+@router.post("/quincena/ajustes")
+async def crear_ajuste(body: AjusteIn, request: Request):
+  """Bono o descuento manual. Si la quincena ya cerró, entra en la siguiente abierta."""
+  s = _admin(request)
+  _puede_ver(s, body.staff_id)
+  if body.tipo not in ("bono", "descuento"):
+    raise HTTPException(status_code=400, detail="Tipo inválido.")
+  if body.monto <= 0 or not body.concepto.strip():
+    raise HTTPException(status_code=400, detail="Escribe el concepto y un monto mayor a 0.")
+  if body.tipo == "descuento" and not _es_direccion(s):
+    raise HTTPException(status_code=403, detail="Solo Dirección puede capturar descuentos.")
+  d1, d2 = _quincena_de(body.inicio)
+  while True:
+    reg = _registro_quincena(d1, d2)
+    if reg["estado"] != "cerrada":
+      break
+    d1, d2 = _quincena_de(d2.isoformat())
+  supabase.table("ajustes_pago").insert({
+    "staff_id": body.staff_id, "quincena_inicio": d1.isoformat(), "sucursal_id": body.sucursal_id,
+    "tipo": body.tipo, "concepto": body.concepto.strip(), "monto": body.monto, "creado_por": s["id"],
+  }).execute()
+  return {"ok": True, "quincena": d1.isoformat()}
+
+
+class AnularAjusteIn(BaseModel):
+  motivo: str
+
+
+@router.post("/quincena/ajustes/{ajuste_id}/anular")
+async def anular_ajuste(ajuste_id: str, body: AnularAjusteIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  aj = supabase.table("ajustes_pago").select("quincena_inicio").eq("id", ajuste_id).limit(1).execute().data
+  if not aj:
+    raise HTTPException(status_code=404, detail="No existe ese ajuste.")
+  _abierta(date.fromisoformat(aj[0]["quincena_inicio"]))
+  if len(body.motivo.strip()) < 5:
+    raise HTTPException(status_code=400, detail="Escribe el motivo.")
+  supabase.table("ajustes_pago").update({"activo": False, "anulado_por": s["id"], "anulado_motivo": body.motivo.strip()})\
+    .eq("id", ajuste_id).execute()
+  return {"ok": True}
+
+
+@router.post("/quincena/cerrar")
+async def cerrar_quincena(body: InicioIn, request: Request):
+  s = _admin(request)
+  _solo_direccion(s)
+  d1, d2 = _quincena_de(body.inicio)
+  reg = _registro_quincena(d1, d2)
+  if reg["estado"] == "cerrada":
+    raise HTTPException(status_code=400, detail="Esa quincena ya está cerrada.")
+  if _ahora().astimezone(CDMX).date() < d2 - timedelta(days=1):
+    raise HTTPException(status_code=400, detail="Todavía no termina la quincena: se puede cerrar desde su último día.")
+  datos = _calcular_quincena(d1, d2, None)
+  if datos["pendientes"]:
+    raise HTTPException(status_code=400, detail=f"Hay {len(datos['pendientes'])} pendientes por resolver antes de cerrar.")
+  aprobadas = {a["sucursal_id"] for a in supabase.table("quincena_aprobaciones").select("sucursal_id")
+               .eq("quincena_inicio", d1.isoformat()).execute().data or []}
+  faltan = [x["nombre"] for x in datos["sucursales"] if x["id"] not in aprobadas]
+  if faltan:
+    raise HTTPException(status_code=400, detail=f"Falta la aprobación de: {', '.join(faltan)}.")
+  supabase.table("quincenas").update({
+    "estado": "cerrada", "cerrada_por": s["id"], "cerrada_at": _ahora().isoformat(), "snapshot": datos,
+  }).eq("inicio", d1.isoformat()).execute()
+  return {"ok": True, "total": datos["totales"]["total"]}
+
+
+# ── Excel de prenómina ───────────────────────────────────────────────────────
+@router.get("/quincena/excel")
+async def excel_quincena(request: Request, inicio: str | None = None, sucursal_id: str | None = None):
+  from openpyxl import Workbook
+  from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+  from openpyxl.utils import get_column_letter
+
+  s = _admin(request)
+  alcance = _alcance(s, sucursal_id)
+  d1, d2 = _quincena_de(inicio)
+  reg = _registro_quincena(d1, d2)
+  cerrada = reg["estado"] == "cerrada" and reg.get("snapshot") and alcance is None
+  datos = reg["snapshot"] if cerrada else _calcular_quincena(d1, d2, alcance)
+  bancos = {}
+  if _es_direccion(s):
+    for b in supabase.table("staff_datos_bancarios").select("staff_id, banco, clabe, titular").execute().data or []:
+      bancos[b["staff_id"]] = b
+
+  NEGRO, GRIS, BLANCO = "171B24", "F4F5F7", "FFFFFF"
+  MONEDA = '"$"#,##0.00'
+  borde = Border(bottom=Side(style="thin", color="E5E7EB"))
+  ultimo = d2 - timedelta(days=1)
+  meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+  periodo = f"{d1.day} al {ultimo.day} de {meses[ultimo.month - 1]} {ultimo.year}"
+
+  wb = Workbook()
+
+  def hoja(ws, titulo: str, columnas: list[tuple[str, int, str | None]], filas: list[list], total_cols: list[int] | None = None):
+    ws.title = titulo
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "NAVY TRAINING CENTER"
+    ws["A1"].font = Font(bold=True, size=16, color=NEGRO)
+    ws["A2"] = f"Prenómina · {periodo} · {titulo}"
+    ws["A2"].font = Font(size=11, color="6B7280")
+    ws["A3"] = ("CERRADA" if reg["estado"] == "cerrada" else "ABIERTA · los montos pueden cambiar hasta el cierre") + \
+               f" · generado {_ahora().astimezone(CDMX).strftime('%d/%m/%Y %H:%M')}"
+    ws["A3"].font = Font(size=9, color="9CA3AF", italic=True)
+    fila_enc = 5
+    for i, (nombre, ancho, _) in enumerate(columnas, start=1):
+      celda = ws.cell(row=fila_enc, column=i, value=nombre)
+      celda.font = Font(bold=True, color=BLANCO, size=10)
+      celda.fill = PatternFill("solid", fgColor=NEGRO)
+      celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+      ws.column_dimensions[get_column_letter(i)].width = ancho
+    ws.row_dimensions[fila_enc].height = 30
+    for r, valores in enumerate(filas, start=fila_enc + 1):
+      for i, v in enumerate(valores, start=1):
+        celda = ws.cell(row=r, column=i, value=v)
+        celda.border = borde
+        celda.font = Font(size=10)
+        if (r - fila_enc) % 2 == 0:
+          celda.fill = PatternFill("solid", fgColor=GRIS)
+        fmt = columnas[i - 1][2]
+        if fmt == "moneda":
+          celda.number_format = MONEDA
+        elif fmt == "texto":
+          celda.number_format = "@"
+          celda.alignment = Alignment(horizontal="left")
+    if total_cols and filas:
+      r = fila_enc + len(filas) + 1
+      ws.cell(row=r, column=1, value="TOTAL").font = Font(bold=True, color=BLANCO)
+      for i in range(1, len(columnas) + 1):
+        ws.cell(row=r, column=i).fill = PatternFill("solid", fgColor=NEGRO)
+      for i in total_cols:
+        col = get_column_letter(i)
+        celda = ws.cell(row=r, column=i, value=f"=SUM({col}{fila_enc + 1}:{col}{r - 1})")
+        celda.font = Font(bold=True, color=BLANCO)
+        celda.number_format = MONEDA
+    ws.freeze_panes = ws.cell(row=fila_enc + 1, column=2)
+    if filas:
+      ws.auto_filter.ref = f"A{fila_enc}:{get_column_letter(len(columnas))}{fila_enc + len(filas)}"
+
+  # 1. Resumen
+  todos = sorted(datos["coaches"] + datos["staff"], key=lambda p: (p.get("sucursal") or "", p["nombre"]))
+  cols = [("Persona", 30, None), ("Puesto", 14, None), ("Nivel", 11, None), ("Sucursal", 18, None), ("Esquema", 13, None),
+          ("Clases", 9, None), ("Días", 8, None), ("Sueldo / horas", 15, "moneda"), ("Clases $", 14, "moneda"),
+          ("Bonos", 12, "moneda"), ("Festivos", 12, "moneda"), ("Ajustes", 12, "moneda"), ("TOTAL", 15, "moneda")]
+  if bancos:
+    cols += [("Banco", 14, None), ("CLABE", 22, "texto"), ("Titular", 24, None), ("Efectivo", 9, None)]
+  filas = []
+  for p in todos:
+    fila = [p["nombre"], "Front Desk" if p["puesto"] == "Front" else p["puesto"], p.get("nivel") or "", p.get("sucursal") or "",
+            p["esquema"], p["clases"], p["dias"], p["sueldo"], p["monto_clases"], p["bonos"], p["pago_festivos"], p["ajustes"], p["total"]]
+    if bancos:
+      b = bancos.get(p["staff_id"], {})
+      fila += [b.get("banco") or "", b.get("clabe") or "", b.get("titular") or "", "Sí" if p.get("efectivo") else ""]
+    filas.append(fila)
+  hoja(wb.active, "Resumen", cols, filas, total_cols=[8, 9, 10, 11, 12, 13])
+
+  # 2. Coaches: clase por clase
+  cols = [("Fecha", 12, None), ("Hora", 8, None), ("Coach", 26, None), ("Nivel", 11, None), ("Sucursal", 18, None),
+          ("Clase", 24, None), ("Min", 7, None), ("Asistentes", 10, None), ("Tarifa", 12, "moneda"), ("% pagado", 9, None),
+          ("Suplencia", 10, None), ("Bonos aplicados", 26, None), ("Clase $", 12, "moneda"), ("Bono $", 11, "moneda"),
+          ("Total", 12, "moneda"), ("Estado", 12, None), ("Nota", 34, None)]
+  filas = []
+  for p in sorted(datos["coaches"], key=lambda p: p["nombre"]):
+    for l in p["detalle_clases"]:
+      h = _dt(l["horario"]).astimezone(CDMX)
+      filas.append([h.strftime("%d/%m/%Y"), h.strftime("%H:%M"), p["nombre"], l.get("nivel") or "", l.get("sucursal") or "",
+                    l.get("clase") or "", l.get("duracion"), l.get("asistentes"), l.get("tarifa"), f"{int(l.get('porcentaje') or 100)}%",
+                    "Sí" if l.get("suplencia") else "", ", ".join(b["nombre"] for b in l.get("bonos") or []),
+                    l.get("monto_clase"), l.get("bono"), l.get("total"),
+                    {"impartida": "Pagada", "sin_checar": "Sin checar", "revisar": "Por revisar"}.get(l["estado"], l["estado"]),
+                    l.get("motivo") or ""])
+  hoja(wb.create_sheet(), "Coaches", cols, filas, total_cols=[13, 14, 15])
+
+  # 3. Staff
+  cols = [("Persona", 30, None), ("Puesto", 14, None), ("Sucursal", 18, None), ("Esquema", 12, None), ("Días", 8, None),
+          ("Horas", 8, None), ("Sueldo / horas", 15, "moneda"), ("Festivos trab.", 12, None), ("Pago festivos", 14, "moneda"),
+          ("Faltas", 8, None), ("Retardos", 9, None), ("Min. tarde", 10, None), ("Ajustes", 12, "moneda"), ("TOTAL", 15, "moneda")]
+  filas = [[p["nombre"], "Front Desk" if p["puesto"] == "Front" else p["puesto"], p.get("sucursal") or "", p["esquema"],
+            p["dias"], p["horas"], p["sueldo"], p["festivos"], p["pago_festivos"], p["faltas"], p["retardos"],
+            p["minutos_tarde"], p["ajustes"], p["total"]] for p in sorted(datos["staff"], key=lambda p: p["nombre"])]
+  hoja(wb.create_sheet(), "Staff", cols, filas, total_cols=[7, 9, 13, 14])
+
+  # 4. Ajustes
+  cols = [("Persona", 30, None), ("Tipo", 11, None), ("Concepto", 40, None), ("Monto", 13, "moneda"), ("Capturó", 24, None), ("Fecha", 14, None)]
+  filas = [[p["nombre"], a["tipo"].capitalize(), a["concepto"], a["monto"] if a["tipo"] == "bono" else -a["monto"],
+            a.get("capturo") or "", _dt(a["fecha"]).astimezone(CDMX).strftime("%d/%m/%Y")]
+           for p in todos for a in p.get("detalle_ajustes", [])]
+  hoja(wb.create_sheet(), "Ajustes", cols, filas, total_cols=[4])
+
+  if datos.get("pendientes"):
+    cols = [("Persona", 28, None), ("Pendiente", 50, None), ("Detalle", 40, None)]
+    filas = [[x.get("persona") or "", x.get("texto") or "", x.get("motivo") or ""] for x in datos["pendientes"]]
+    hoja(wb.create_sheet(), "Pendientes", cols, filas)
+
+  buf = io.BytesIO()
+  wb.save(buf)
+  buf.seek(0)
+  nombre_archivo = f"prenomina-navy-{d1.isoformat()}.xlsx"
+  return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           headers={"Content-Disposition": f'attachment; filename="{nombre_archivo}"'})
