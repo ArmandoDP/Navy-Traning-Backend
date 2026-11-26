@@ -135,8 +135,9 @@ async def totalpass_booking_webhook(request: Request):
     if not slot_id:
       return { "received": True, "error": "slot_id faltante" }
 
-    # ── Cancelación ──
-    if "cancel" in estado:
+    # ── Cancelación, expiración o rechazo: el lugar se libera ──
+    # (antes solo se reconocía "cancel"; las "expired"/"rejected" se quedaban ocupando lugar)
+    if any(x in estado for x in ("cancel", "expired", "reject", "denied", "refused")):
       return await _cancelar_booking_totalpass(slot_id, body)
 
     clase_res = supabase.table("clases").select("id, capacidad_max, sucursal_id")\
