@@ -199,7 +199,27 @@ async def perfil(staff_id: str, request: Request):
 
   impartidas = sum(1 for c in lista if c["estado"] == "impartida")
   con_llegada = [c["llegaron"] for c in lista if c["estado"] == "impartida"]
-  horario = _horario_semana(staff_id, st["sucursal_asignada_id"]) if st.get("sucursal_asignada_id") else None
+  # Turnos de esta quincena en TODAS sus sucursales (quincena capturada > horario fijo)
+  d1q = ini_q.astimezone(CDMX).date()
+  d2q = (fin_q - timedelta(days=1)).astimezone(CDMX).date()
+  hoy_q = ahora.astimezone(CDMX).date()
+  efectivos = horarios_efectivos([staff_id], None, d1q, d2q)
+  nombres_suc = {x["id"]: x["nombre"] for x in supabase.table("sucursales").select("id, nombre").execute().data or []}
+  por_dia: dict[str, list] = {}
+  for (_sid, suc, f), bloques in efectivos.items():
+    por_dia.setdefault(f, []).extend({"entrada": e, "salida": x, "sucursal": nombres_suc.get(suc)} for e, x in bloques)
+  dias_q = []
+  d = d1q
+  while d <= d2q:
+    dias_q.append({"fecha": d.isoformat(), "dia_semana": d.isoweekday() % 7,
+                   "turnos": sorted(por_dia.get(d.isoformat(), []), key=lambda t: t["entrada"])})
+    d += timedelta(days=1)
+  horario = {
+    "hoy": sorted(por_dia.get(hoy_q.isoformat(), []), key=lambda t: t["entrada"]),
+    "hoy_fecha": hoy_q.isoformat(),
+    "dias": dias_q,
+    "con_horario": bool(efectivos),
+  }
 
   return {
     "quincena": {"inicio": ini_q.isoformat(), "fin": fin_q.isoformat()},
