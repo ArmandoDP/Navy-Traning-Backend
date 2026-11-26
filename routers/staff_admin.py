@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from services.supabase import supabase
 from routers.checador import (
   _staff, _es_admin, _sucursales_de, _quincena, _quincena_staff, _horario_semana,
-  _ahora, _dt, CDMX,
+  _ahora, _dt, CDMX, horarios_efectivos,
 )
 
 router = APIRouter()
@@ -567,15 +567,12 @@ def _bitacora_datos(alcance: set | None, ini: datetime, fin: datetime, d1: date,
   ahora = _ahora()
   hoy = ahora.astimezone(CDMX).date()
 
-  qh = supabase.table("staff_horarios").select("staff_id, sucursal_id, dia_semana, hora_entrada, hora_salida")\
-    .eq("activo", True).order("hora_entrada")
-  if alcance is not None:
-    qh = qh.in_("sucursal_id", list(alcance))
-  horarios = qh.execute().data or []
-  if not horarios:
+  # Horario efectivo de cada día (quincena capturada > horario fijo)
+  efectivos = horarios_efectivos(None, alcance, d1, min(d2, hoy))
+  if not efectivos:
     return {"tolerancia": tolerancia, "desde": d1.isoformat(), "hasta": d2.isoformat(), "incidencias": [], "personas": []}
 
-  ids = {h["staff_id"] for h in horarios}
+  ids = {k[0] for k in efectivos}
   staff = {f["id"]: f for f in supabase.table("staff").select("id, nombre, primer_apellido, estatus")
            .in_("id", list(ids)).execute().data or []}
   sucs = {f["id"]: f["nombre"] for f in supabase.table("sucursales").select("id, nombre").execute().data or []}
@@ -592,39 +589,33 @@ def _bitacora_datos(alcance: set | None, ini: datetime, fin: datetime, d1: date,
     clave = (c["staff_id"], c["sucursal_id"], t.astimezone(CDMX).date())
     entradas.setdefault(clave, t)                     # la primera del día
 
-  primer_bloque: dict[tuple, dict] = {}
-  for h in horarios:
-    primer_bloque.setdefault((h["staff_id"], h["sucursal_id"], h["dia_semana"]), h)
-
   incidencias = []
-  d = d1
-  while d <= min(d2, hoy):
-    dia = _dia_semana(d)
-    for (sid, suc, ds), h in primer_bloque.items():
-      if ds != dia or (staff.get(sid) or {}).get("estatus", "Activo") not in ("Activo", None):
-        continue
-      hh, mm = int(h["hora_entrada"][:2]), int(h["hora_entrada"][3:5])
-      programada = datetime(d.year, d.month, d.day, hh, mm, tzinfo=CDMX)
-      llegada = entradas.get((sid, suc, d))
-      festivo = festivos.get((d.isoformat(), suc)) or festivos.get((d.isoformat(), None))
-      base = {"fecha": d.isoformat(), "staff_id": sid,
-              "nombre": f"{staff.get(sid, {}).get('nombre') or ''} {staff.get(sid, {}).get('primer_apellido') or ''}".strip(),
-              "sucursal": sucs.get(suc), "programada": h["hora_entrada"][:5],
-              "llegada": llegada.isoformat() if llegada else None}
-      if festivo:
-        if llegada:
-          incidencias.append({**base, "tipo": "festivo_trabajado", "detalle": festivo["nombre"], "minutos": 0,
-                              "multiplicador": float(festivo.get("multiplicador") or 3)})
-        continue
-      if not llegada:
-        if d == hoy and ahora < programada + timedelta(minutes=tolerancia):
-          continue                                     # todavía no es hora
-        incidencias.append({**base, "tipo": "falta", "detalle": None, "minutos": 0})
-      else:
-        tarde = int((llegada - programada).total_seconds() // 60)
-        if tarde > tolerancia:
-          incidencias.append({**base, "tipo": "retardo", "detalle": None, "minutos": tarde})
-    d += timedelta(days=1)
+  for (sid, suc, f), bloques in sorted(efectivos.items(), key=lambda x: x[0][2]):
+    d = date.fromisoformat(f)
+    if (staff.get(sid) or {}).get("estatus", "Activo") not in ("Activo", None):
+      continue
+    entrada_txt = bloques[0][0]
+    hh, mm = int(entrada_txt[:2]), int(entrada_txt[3:5])
+    programada = datetime(d.year, d.month, d.day, hh, mm, tzinfo=CDMX)
+    llegada = entradas.get((sid, suc, d))
+    festivo = festivos.get((d.isoformat(), suc)) or festivos.get((d.isoformat(), None))
+    base = {"fecha": d.isoformat(), "staff_id": sid,
+            "nombre": f"{staff.get(sid, {}).get('nombre') or ''} {staff.get(sid, {}).get('primer_apellido') or ''}".strip(),
+            "sucursal": sucs.get(suc), "programada": entrada_txt,
+            "llegada": llegada.isoformat() if llegada else None}
+    if festivo:
+      if llegada:
+        incidencias.append({**base, "tipo": "festivo_trabajado", "detalle": festivo["nombre"], "minutos": 0,
+                            "multiplicador": float(festivo.get("multiplicador") or 3)})
+      continue
+    if not llegada:
+      if d == hoy and ahora < programada + timedelta(minutes=tolerancia):
+        continue                                     # todavía no es hora
+      incidencias.append({**base, "tipo": "falta", "detalle": None, "minutos": 0})
+    else:
+      tarde = int((llegada - programada).total_seconds() // 60)
+      if tarde > tolerancia:
+        incidencias.append({**base, "tipo": "retardo", "detalle": None, "minutos": tarde})
 
   resumen: dict[str, dict] = {}
   for i in incidencias:
@@ -1439,3 +1430,151 @@ async def excel_quincena(request: Request, inicio: str | None = None, sucursal_i
   nombre_archivo = f"prenomina-navy-{d1.isoformat()}.xlsx"
   return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            headers={"Content-Disposition": f'attachment; filename="{nombre_archivo}"'})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Horario por quincena (turnos por fecha). Si se captura, manda sobre el horario fijo.
+# ══════════════════════════════════════════════════════════════════════════════
+def _dias_quincena(d1: date, d2: date) -> list[date]:
+  return [d1 + timedelta(days=i) for i in range((d2 - d1).days)]
+
+
+def _horas(bloques: list) -> float:
+  return round(sum((int(b[1][:2]) * 60 + int(b[1][3:5]) - int(b[0][:2]) * 60 - int(b[0][3:5])) / 60 for b in bloques), 1)
+
+
+@router.get("/turnos")
+async def ver_turnos(request: Request, sucursal_id: str | None = None, inicio: str | None = None):
+  s = _admin(request)
+  suc = _sucursal_requerida(s, sucursal_id)
+  d1, d2 = _quincena_de(inicio)
+  dias = _dias_quincena(d1, d2)
+  efectivos = horarios_efectivos(None, {suc}, d1, d2 - timedelta(days=1))
+  marcadas = {m["staff_id"] for m in supabase.table("staff_turnos_quincenas").select("staff_id")
+              .eq("sucursal_id", suc).eq("quincena_inicio", d1.isoformat()).execute().data or []}
+  con_fijo = {h["staff_id"] for h in supabase.table("staff_horarios").select("staff_id")
+              .eq("sucursal_id", suc).eq("activo", True).execute().data or []}
+  fest = supabase.table("dias_festivos").select("fecha, nombre, sucursal_id").eq("activo", True)\
+    .gte("fecha", d1.isoformat()).lt("fecha", d2.isoformat()).execute().data or []
+  festivos = {f["fecha"]: f["nombre"] for f in fest if f.get("sucursal_id") in (None, suc)}
+  personas: dict[str, dict] = {}
+  for (sid, _s, f), bloques in efectivos.items():
+    p = personas.setdefault(sid, {"dias": {}, "horas": 0.0})
+    p["dias"][f] = [{"entrada": e, "salida": x} for e, x in bloques]
+    p["horas"] = round(p["horas"] + _horas(bloques), 1)
+  for sid in marcadas | con_fijo:
+    personas.setdefault(sid, {"dias": {}, "horas": 0.0})
+  for sid, p in personas.items():
+    p["modo"] = "quincena" if sid in marcadas else ("fijo" if sid in con_fijo else "ninguno")
+  return {"inicio": d1.isoformat(), "fin": d2.isoformat(),
+          "dias": [{"fecha": d.isoformat(), "dia_semana": d.isoweekday() % 7, "festivo": festivos.get(d.isoformat())} for d in dias],
+          "personas": personas}
+
+
+class BloqueHora(BaseModel):
+  entrada: str
+  salida: str
+
+
+class TurnosIn(BaseModel):
+  sucursal_id: str
+  inicio: str
+  dias: dict[str, list[BloqueHora]]      # {'2026-11-16': [{entrada: '07:00', salida: '15:00'}], …}
+
+
+def _guardar_quincena(staff_id: str, suc: str, d1: date, d2: date, dias: dict[str, list[tuple]], hecho_por: str):
+  validas = {d.isoformat() for d in _dias_quincena(d1, d2)}
+  filas = []
+  for f, bloques in dias.items():
+    if f not in validas:
+      raise HTTPException(status_code=400, detail=f"La fecha {f} no es de esta quincena.")
+    orden = sorted(bloques)
+    for e, x in orden:
+      if x <= e:
+        raise HTTPException(status_code=400, detail=f"El {f}: la salida debe ser después de la entrada ({e}–{x}).")
+    for (e1, x1), (e2, _x2) in zip(orden, orden[1:]):
+      if e2 < x1:
+        raise HTTPException(status_code=400, detail=f"El {f} hay dos turnos encimados.")
+    filas += [{"staff_id": staff_id, "sucursal_id": suc, "fecha": f, "hora_entrada": e, "hora_salida": x, "creado_por": hecho_por}
+              for e, x in orden]
+  supabase.table("staff_turnos").delete().eq("staff_id", staff_id).eq("sucursal_id", suc)\
+    .gte("fecha", d1.isoformat()).lt("fecha", d2.isoformat()).execute()
+  if filas:
+    supabase.table("staff_turnos").insert(filas).execute()
+  supabase.table("staff_turnos_quincenas").upsert({
+    "staff_id": staff_id, "sucursal_id": suc, "quincena_inicio": d1.isoformat(),
+    "capturado_por": hecho_por, "capturado_at": _ahora().isoformat(),
+  }, on_conflict="staff_id,sucursal_id,quincena_inicio").execute()
+  return len(filas)
+
+
+@router.put("/turnos/{staff_id}")
+async def guardar_turnos(staff_id: str, body: TurnosIn, request: Request):
+  s = _admin(request)
+  _alcance(s, body.sucursal_id)
+  _puede_ver(s, staff_id)
+  d1, d2 = _quincena_de(body.inicio)
+  n = _guardar_quincena(staff_id, body.sucursal_id, d1, d2,
+                        {f: [(b.entrada, b.salida) for b in bl] for f, bl in body.dias.items()}, s["id"])
+  return {"ok": True, "turnos": n}
+
+
+@router.delete("/turnos/{staff_id}")
+async def quitar_turnos(staff_id: str, request: Request, sucursal_id: str, inicio: str):
+  """Quita la captura de la quincena: esa persona vuelve a usar su horario fijo."""
+  s = _admin(request)
+  _alcance(s, sucursal_id)
+  _puede_ver(s, staff_id)
+  d1, d2 = _quincena_de(inicio)
+  supabase.table("staff_turnos").delete().eq("staff_id", staff_id).eq("sucursal_id", sucursal_id)\
+    .gte("fecha", d1.isoformat()).lt("fecha", d2.isoformat()).execute()
+  supabase.table("staff_turnos_quincenas").delete().eq("staff_id", staff_id).eq("sucursal_id", sucursal_id)\
+    .eq("quincena_inicio", d1.isoformat()).execute()
+  return {"ok": True}
+
+
+class CopiarIn(BaseModel):
+  sucursal_id: str
+  inicio: str
+  origen: str                 # 'anterior' (las mismas fechas de hace 2 semanas) | 'fijo' (su horario fijo)
+  staff_id: str | None = None # sin staff_id: a todos los que todavía no tienen capturada esta quincena
+
+
+@router.post("/turnos/copiar")
+async def copiar_turnos(body: CopiarIn, request: Request):
+  s = _admin(request)
+  _alcance(s, body.sucursal_id)
+  if body.origen not in ("anterior", "fijo"):
+    raise HTTPException(status_code=400, detail="Origen inválido.")
+  suc = body.sucursal_id
+  d1, d2 = _quincena_de(body.inicio)
+  dias = _dias_quincena(d1, d2)
+  ya = {m["staff_id"] for m in supabase.table("staff_turnos_quincenas").select("staff_id")
+        .eq("sucursal_id", suc).eq("quincena_inicio", d1.isoformat()).execute().data or []}
+
+  if body.origen == "fijo":
+    semana: dict[str, dict[int, list]] = {}
+    for h in supabase.table("staff_horarios").select("staff_id, dia_semana, hora_entrada, hora_salida")\
+        .eq("sucursal_id", suc).eq("activo", True).execute().data or []:
+      semana.setdefault(h["staff_id"], {}).setdefault(h["dia_semana"], []).append((h["hora_entrada"][:5], h["hora_salida"][:5]))
+    fuente = {sid: {d.isoformat(): sem.get(d.isoweekday() % 7, []) for d in dias} for sid, sem in semana.items()}
+  else:
+    previos = horarios_efectivos(None, {suc}, d1 - timedelta(days=14), d2 - timedelta(days=15))
+    fuente: dict[str, dict[str, list]] = {}
+    for (sid, _s, f), bloques in previos.items():
+      destino = (date.fromisoformat(f) + timedelta(days=14)).isoformat()
+      fuente.setdefault(sid, {})[destino] = bloques
+    for sid in list(fuente):
+      for d in dias:
+        fuente[sid].setdefault(d.isoformat(), [])
+
+  objetivos = [body.staff_id] if body.staff_id else [sid for sid in fuente if sid not in ya]
+  if body.staff_id:
+    _puede_ver(s, body.staff_id)
+  copiados = 0
+  for sid in objetivos:
+    if sid not in fuente:
+      continue
+    _guardar_quincena(sid, suc, d1, d2, {f: b for f, b in fuente[sid].items() if f in {d.isoformat() for d in dias}}, s["id"])
+    copiados += 1
+  return {"ok": True, "copiados": copiados, "omitidos_ya_capturados": len([x for x in fuente if x in ya]) if not body.staff_id else 0}

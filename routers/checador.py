@@ -14,7 +14,7 @@
 #     salvo el primero de Front Desk / gerencia que llega cuando no hay nadie más para confirmarlo.
 #   - La salida no necesita confirmación.
 import hashlib, math, os, secrets, time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from services.supabase import supabase
@@ -28,7 +28,8 @@ RADIO_M            = 300     # distancia máxima a la sucursal
 # Validación de ubicación: apagada por defecto mientras se prueba.
 # Para prenderla: en Railway, variable CHECADOR_UBICACION=on (no hay que tocar código).
 VALIDAR_UBICACION  = os.getenv("CHECADOR_UBICACION", "off").lower() == "on"
-VENTANA_ANTES_MIN  = 120     # puede checar desde 2 h antes de su primera clase
+VENTANA_ANTES_MIN  = 120     # coach: puede checar desde 2 h antes de su primera clase
+VENTANA_TURNO_MIN  = 60      # staff, managers y dirección: desde 1 h antes de su turno
 TOLERANCIA_MIN     = 15      # una clase cuenta si checó antes de inicio + 15 min
 GRACIA_SALIDA_MIN  = 10      # el staff que olvida su salida se cierra 10 min después de su hora
 TIPOS_OPERADOR     = {"front", "manager", "submanager", "admin"}
@@ -232,22 +233,78 @@ def _sucursal_hoy(sucursal_id: str) -> list[dict]:
   return out
 
 
-def _turno_de_hoy(staff_id: str, sucursal_id: str) -> tuple[bool, datetime | None]:
-  """¿Le toca hoy según su horario semanal? y su salida programada (el bloque vigente o el siguiente)."""
+def _quincena_inicio(d: date) -> date:
+  return d.replace(day=1 if d.day <= 15 else 16)
+
+
+def horarios_efectivos(staff_ids: list | None, sucursales: set | None, d1: date, d2: date) -> dict:
+  """Turnos de cada persona por día, del d1 al d2 (incluidos): {(staff_id, sucursal_id, 'YYYY-MM-DD'): [('07:00', '15:00'), …]}.
+  Si su quincena se capturó por fechas, manda la quincena (un día sin turno es descanso);
+  si no, se usa su horario fijo semanal. Sin ninguno de los dos, ese día no tiene turno."""
+  def filtrar(q):
+    if staff_ids is not None:
+      q = q.in_("staff_id", list(staff_ids))
+    if sucursales is not None:
+      q = q.in_("sucursal_id", list(sucursales))
+    return q
+  if staff_ids is not None and not staff_ids:
+    return {}
+  semana: dict[tuple, list] = {}
+  for h in filtrar(supabase.table("staff_horarios").select("staff_id, sucursal_id, dia_semana, hora_entrada, hora_salida")
+                   .eq("activo", True)).limit(20000).execute().data or []:
+    semana.setdefault((h["staff_id"], h["sucursal_id"], h["dia_semana"]), []).append((h["hora_entrada"][:5], h["hora_salida"][:5]))
+  por_fecha: dict[tuple, list] = {}
+  for t in filtrar(supabase.table("staff_turnos").select("staff_id, sucursal_id, fecha, hora_entrada, hora_salida")
+                   .gte("fecha", d1.isoformat()).lte("fecha", d2.isoformat())).limit(20000).execute().data or []:
+    por_fecha.setdefault((t["staff_id"], t["sucursal_id"], t["fecha"]), []).append((t["hora_entrada"][:5], t["hora_salida"][:5]))
+  marcadas = {(m["staff_id"], m["sucursal_id"], m["quincena_inicio"]) for m in
+              filtrar(supabase.table("staff_turnos_quincenas").select("staff_id, sucursal_id, quincena_inicio")
+                      .gte("quincena_inicio", _quincena_inicio(d1).isoformat()).lte("quincena_inicio", d2.isoformat()))
+              .limit(20000).execute().data or []}
+  pares = {(k[0], k[1]) for k in semana} | {(k[0], k[1]) for k in por_fecha} | {(k[0], k[1]) for k in marcadas}
+  out: dict[tuple, list] = {}
+  d = d1
+  while d <= d2:
+    q, dia, f = _quincena_inicio(d).isoformat(), d.isoweekday() % 7, d.isoformat()
+    for sid, suc in pares:
+      bloques = por_fecha.get((sid, suc, f), []) if (sid, suc, q) in marcadas else semana.get((sid, suc, dia), [])
+      if bloques:
+        out[(sid, suc, f)] = sorted(bloques)
+    d += timedelta(days=1)
+  return out
+
+
+def bloques_del_dia(staff_id: str, sucursal_id: str, fecha: date) -> list:
+  return horarios_efectivos([staff_id], {sucursal_id}, fecha, fecha).get((staff_id, sucursal_id, fecha.isoformat()), [])
+
+
+def _proximo_turno(staff_id: str, sucursal_id: str) -> str | None:
+  """El siguiente turno (en las próximas 3 semanas), como texto: 'viernes 20 · 7:00'."""
+  ahora = _ahora().astimezone(CDMX)
+  hoy = ahora.date()
+  ef = horarios_efectivos([staff_id], {sucursal_id}, hoy, hoy + timedelta(days=21))
+  dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+  d = hoy
+  while d <= hoy + timedelta(days=21):
+    for ent, _sal in ef.get((staff_id, sucursal_id, d.isoformat()), []):
+      if d > hoy or ent > ahora.strftime("%H:%M"):
+        return f"{'hoy' if d == hoy else ('mañana' if d == hoy + timedelta(days=1) else f'{dias[d.weekday()]} {d.day}')} · {ent}"
+    d += timedelta(days=1)
+  return None
+
+
+def _hora_hoy(hhmm: str) -> datetime:
   local = _ahora().astimezone(CDMX)
-  dia = local.isoweekday() % 7                                    # 0 = domingo
-  bloques = supabase.table("staff_horarios").select("hora_entrada, hora_salida")\
-    .eq("staff_id", staff_id).eq("sucursal_id", sucursal_id).eq("dia_semana", dia).eq("activo", True)\
-    .order("hora_entrada").execute().data or []
+  return local.replace(hour=int(hhmm[0:2]), minute=int(hhmm[3:5]), second=0, microsecond=0).astimezone(timezone.utc)
+
+
+def _turno_de_hoy(staff_id: str, sucursal_id: str) -> tuple[bool, datetime | None]:
+  """¿Tiene turno hoy (horario efectivo)? y su salida programada (la del bloque vigente o el siguiente)."""
+  bloques = bloques_del_dia(staff_id, sucursal_id, _ahora().astimezone(CDMX).date())
   if not bloques:
-    tiene = supabase.table("staff_horarios").select("id").eq("staff_id", staff_id).eq("activo", True).limit(1).execute().data
-    return (False if tiene else None), None                      # None = no tiene horario capturado
-  def a_dt(hhmm: str) -> datetime:
-    h, m = int(hhmm[0:2]), int(hhmm[3:5])
-    return local.replace(hour=h, minute=m, second=0, microsecond=0).astimezone(timezone.utc)
-  salidas = [a_dt(b["hora_salida"]) for b in bloques]
-  vigente = next((x for x in salidas if x > _ahora()), salidas[-1])
-  return True, vigente
+    return False, None
+  salidas = [_hora_hoy(b[1]) for b in bloques]
+  return True, next((x for x in salidas if x > _ahora()), salidas[-1])
 
 
 PUESTOS = {"front": "Front Desk", "galley": "The Galley", "manager": "Manager", "submanager": "Submanager",
@@ -284,11 +341,13 @@ def _horario_semana(staff_id: str, sucursal_id: str) -> dict:
   bloques = supabase.table("staff_horarios").select("dia_semana, hora_entrada, hora_salida")\
     .eq("staff_id", staff_id).eq("sucursal_id", sucursal_id).eq("activo", True)\
     .order("hora_entrada").execute().data or []
-  hoy = _ahora().astimezone(CDMX).isoweekday() % 7
+  local = _ahora().astimezone(CDMX)
+  hoy = local.isoweekday() % 7
+  efectivo = bloques_del_dia(staff_id, sucursal_id, local.date())     # quincena capturada > horario fijo
   return {
     "dias": sorted({b["dia_semana"] for b in bloques}),
     "hoy_idx": hoy,
-    "hoy": [{"entrada": b["hora_entrada"][:5], "salida": b["hora_salida"][:5]} for b in bloques if b["dia_semana"] == hoy],
+    "hoy": [{"entrada": e, "salida": x} for e, x in efectivo],
   }
 
 
@@ -632,6 +691,26 @@ async def escanear(body: Escaneo, request: Request):
       return _rechazo("fuera_de_ventana", "Tus clases de hoy ya terminaron", "No se registró tu entrada.",
                       sucursal=suc["nombre"])
   else:
+    # Staff, managers y dirección: parejo, solo con turno ese día (horario de la quincena o fijo)
+    bloques = bloques_del_dia(s["id"], suc_id, _ahora().astimezone(CDMX).date())
+    if not bloques:
+      prox = _proximo_turno(s["id"], suc_id)
+      _intento(s, suc_id, "sin_turno", "No tiene turno hoy en su horario", request, body, distancia)
+      return _rechazo("sin_turno", "Hoy no tienes turno",
+                      f"Hoy no apareces en el horario de {suc['nombre']}. Si vienes a cubrir a alguien, pídele a tu Manager que registre tu entrada."
+                      + (f" Tu próximo turno: {prox}." if prox else ""), sucursal=suc["nombre"], proximo_turno=prox)
+    ahora = _ahora()
+    primera_entrada = _hora_hoy(bloques[0][0])
+    ultima_salida = _hora_hoy(bloques[-1][1])
+    if ahora < primera_entrada - timedelta(minutes=VENTANA_TURNO_MIN):
+      _intento(s, suc_id, "fuera_de_ventana", "Demasiado temprano para su turno", request, body, distancia)
+      desde = (primera_entrada - timedelta(minutes=VENTANA_TURNO_MIN)).astimezone(CDMX).strftime("%H:%M")
+      return _rechazo("fuera_de_ventana", "Todavía es muy temprano",
+                      f"Tu turno empieza a las {bloques[0][0]}. Puedes checar a partir de las {desde}.", sucursal=suc["nombre"])
+    if ahora > ultima_salida:
+      _intento(s, suc_id, "fuera_de_ventana", "Su turno de hoy ya terminó", request, body, distancia)
+      return _rechazo("fuera_de_ventana", "Tu turno de hoy ya terminó",
+                      f"Tu turno era hasta las {bloques[-1][1]}. No se registró tu entrada.", sucursal=suc["nombre"])
     dia_asignado, salida_prog = _turno_de_hoy(s["id"], suc_id)
 
   # El primero de Front Desk / gerencia que llega no tiene quién lo confirme: se confirma solo
